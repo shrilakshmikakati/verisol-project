@@ -72,12 +72,7 @@ cmd_check() {
   "$PYTHON" "$CLI" check
 }
 
-# ── demo command ───────────────────────────────────────────────
-cmd_demo() {
-  require_venv
-  local out="${1:-./contractforge_output/demo}"
-  "$PYTHON" "$CLI" demo --output "$out"
-}
+
 
 # ── run command ────────────────────────────────────────────────
 cmd_run() {

@@ -142,13 +142,6 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
     print_progress("Building e-contract knowledge graph (NLP)...", 15)
     G_e     = build_econtract_knowledge_graph(text)
     ec_dict = graph_to_dict(G_e)
-    ec_img  = render_graph_base64(G_e, "E-Contract Knowledge Graph")
-
-    # Save KG image
-    import base64
-    ec_img_path = out / "econtract_kg.png"
-    ec_img_path.write_bytes(base64.b64decode(ec_img))
-
     print_step(cyan("②"), f"E-Contract KG built  "
                f"{dim(f'{G_e.number_of_nodes()} nodes, {G_e.number_of_edges()} edges')}")
     _print_kg_summary(ec_dict, "E-Contract")
@@ -160,16 +153,13 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
 
     # ── Step 4: Smart Contract KG ─────────────────────────────
     print_progress("Building smart contract knowledge graph (AST)...", 55)
-    G_s_init    = build_smartcontract_knowledge_graph(initial_solidity)
-    sc_init_img = sc_render(G_s_init, "Smart Contract KG (Initial)")
-    sc_init_path = out / "smartcontract_kg_initial.png"
-    sc_init_path.write_bytes(base64.b64decode(sc_init_img))
+    G_s_init = build_smartcontract_knowledge_graph(initial_solidity)
     print_step(cyan("④"), f"Smart Contract KG built  "
                f"{dim(f'{G_s_init.number_of_nodes()} nodes, {G_s_init.number_of_edges()} edges')}")
 
     # ── Step 5: Initial comparison ────────────────────────────
     print_progress("Comparing knowledge graphs...", 65)
-    initial_cmp = compare_knowledge_graphs(G_e, G_s_init)
+    initial_cmp = compare_knowledge_graphs(G_e, G_s_init, initial_solidity)
     print_step(cyan("⑤"), "KG Comparison (initial)")
     _print_comparison(initial_cmp, "Initial")
 
@@ -191,11 +181,9 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
     # ── Step 7: Final KG + comparison ────────────────────────
     print_progress("Building final smart contract KG...", 90)
     G_s_final    = build_smartcontract_knowledge_graph(final_solidity)
-    sc_final_img = sc_render(G_s_final, "Smart Contract KG (Final)")
-    sc_final_path = out / "smartcontract_kg_final.png"
-    sc_final_path.write_bytes(base64.b64decode(sc_final_img))
 
-    final_cmp = compare_knowledge_graphs(G_e, G_s_final)
+
+    final_cmp = compare_knowledge_graphs(G_e, G_s_final, final_solidity)
     print_step(cyan("⑦"), "KG Comparison (final)")
     _print_comparison(final_cmp, "Final")
 
@@ -208,7 +196,7 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
     results = _build_results_dict(
         contract_name, file_path, initial_cmp, final_cmp, history, iterations_used
     )
-    json_path = out / "accuracy_results.json"
+    json_path = out / "results.json"
     json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
     # Copy original e-contract
@@ -218,13 +206,10 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
     except Exception:
         pass
 
-    # ZIP everything
-    zip_path = out / f"{contract_name}_results.zip"
-    _make_zip(zip_path, out, contract_name, file_path, final_solidity, results)
 
     # ── Final summary ─────────────────────────────────────────
     print(f"\n\n{'─'*60}")
-    _print_final_summary(final_cmp, iterations_used, out, sol_path, zip_path)
+    _print_final_summary(final_cmp, iterations_used, out, sol_path)
 
     return str(sol_path)
 
@@ -260,7 +245,6 @@ def _print_comparison(cmp: dict, label: str):
     edge_s = str(round(cmp["edge_similarity"], 1)) + "%"
     type_s = str(round(cmp["type_coverage"]["type_coverage_pct"], 1)) + "%"
     print(f"     Node similarity  {cyan(node_s)}   Edge similarity  {cyan(edge_s)}   Type coverage  {cyan(type_s)}")
-    # Show 3-tier breakdown if available
     tiers = cmp.get("node_tiers", {})
     if tiers:
         ta = str(round(tiers.get("tier_a", 0), 1)) + "%"
@@ -280,13 +264,37 @@ def _print_comparison(cmp: dict, label: str):
 
 def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn):
     """Delegates to the additive patch refinement_loop; shows per-iter progress."""
-    from core.kg_comparison import refinement_loop
-
-    # Monkey-patch progress printer into the loop via a wrapper
-    # We run refinement_loop then replay history for display
-    print("")  # newline after progress bar
-
-    final_code, history, iters_used = refinement_loop(initial_solidity, text, G_e)
+    from backend.core.kg_comparison import refinement_loop
+    import threading
+    print("") 
+    
+    # Run refinement in a thread with timeout
+    result = [None, None, 0]  # [final_code, history, iters_used]
+    error = [None]
+    
+    def run_refinement():
+        try:
+            result[0], result[1], result[2] = refinement_loop(initial_solidity, text, G_e)
+        except Exception as e:
+            error[0] = e
+    
+    thread = threading.Thread(target=run_refinement, daemon=False)
+    thread.start()
+    thread.join(timeout=120)  # 2 minute timeout
+    
+    # If refinement timed out or errored, just use initial solidity
+    if thread.is_alive():
+        print(dim("     [Refinement timeout after 120s — using initial solidity]"))
+        return initial_solidity, [], 0
+    
+    if error[0]:
+        print(yellow(f"     ⚠ Refinement error: {error[0]} — using initial solidity"))
+        return initial_solidity, [], 0
+    
+    final_code, history, iters_used = result
+    
+    if final_code is None:
+        return initial_solidity, [], 0
 
     for h in history:
         i        = h["iteration"]
@@ -374,7 +382,7 @@ def _make_zip(zip_path: Path, out_dir: Path, name: str, orig_file: str,
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"econtract/{Path(orig_file).name}", Path(orig_file).read_bytes())
         zf.writestr(f"{name}.sol", solidity.encode())
-        zf.writestr("accuracy_results.json", json.dumps(results, indent=2).encode())
+        zf.writestr("results.json", json.dumps(results, indent=2).encode())
         zf.writestr("README.txt", readme.encode())
         for img in ["econtract_kg.png", "smartcontract_kg_initial.png", "smartcontract_kg_final.png"]:
             p = out_dir / img
@@ -382,7 +390,7 @@ def _make_zip(zip_path: Path, out_dir: Path, name: str, orig_file: str,
                 zf.write(p, img)
 
 
-def _print_final_summary(cmp, iterations, out, sol_path, zip_path):
+def _print_final_summary(cmp, iterations, out, sol_path):
     acc   = cmp["accuracy"]
     valid = cmp["is_valid"]
     color = green if valid else yellow
@@ -394,11 +402,14 @@ def _print_final_summary(cmp, iterations, out, sol_path, zip_path):
     print(f"  {'EC nodes':<22} {dim(str(cmp['ec_node_count']))}   "
           f"SC nodes  {dim(str(cmp['sc_node_count']))}")
     print(f"\n  {bold('OUTPUT FILES')}\n")
-    print(f"  {green('→')}  Smart contract   {cyan(str(sol_path))}")
-    print(f"  {green('→')}  Accuracy JSON    {cyan(str(out / 'accuracy_results.json'))}")
-    print(f"  {green('→')}  EC KG image      {cyan(str(out / 'econtract_kg.png'))}")
-    print(f"  {green('→')}  SC KG image      {cyan(str(out / 'smartcontract_kg_final.png'))}")
-    print(f"  {green('→')}  Results ZIP      {cyan(str(zip_path))}")
+    
+    # Find the copied econtract file
+    econtract_files = list(out.glob("econtract.*"))
+    if econtract_files:
+        print(f"  {green('→')}  Original contract {cyan(str(econtract_files[0]))}")
+    
+    print(f"  {green('→')}  Smart contract    {cyan(str(sol_path))}")
+    print(f"  {green('→')}  Results JSON      {cyan(str(out / 'results.json'))}")
     print(f"\n{'─'*60}\n")
 
 

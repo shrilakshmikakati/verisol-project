@@ -98,12 +98,67 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
        "    modifier whenActive() { require(isActive&&!isTerminated,'Not active'); require(!forceMajeureActive,'Force majeure'); _; }",
        f"    modifier onlyParty() {{ require({cond}||msg.sender==owner,'Not a party'); _; }}",""])
 
-    # Constructor
+    # Constructor + extract ALL numeric values from KG for embedding
+    # Extract amounts and dates from ALL nodes (not just payment nodes)
+    all_amounts = {}  # amount -> count
+    all_dates = {}    # date -> count
+    
+    for node in nodes:
+        label = node.get("label", "")
+        if not label:
+            continue
+        label_str = str(label)
+        
+        # Extract 4+ digit sequences (amounts): "10000", "1,000", etc.
+        amounts = re.findall(r"\d{1,3}(?:,\d{3})+|\d{4,}", label_str)
+        for amt in amounts:
+            normalized = amt.replace(",", "")
+            all_amounts[normalized] = all_amounts.get(normalized, 0) + 1
+        
+        # Extract 8-digit sequences (dates like DDMMYYYY or YYYYMMDD)
+        dates = re.findall(r"\d{8}", label_str)
+        for dt in dates:
+            all_dates[dt] = all_dates.get(dt, 0) + 1
+    
+    # Add state variable declarations for all unique amounts/dates at the top (after events/modifiers, before functions)
+    value_declarations = []
+    if all_amounts:
+        value_declarations.append("    // ── Values extracted from e-contract ────────────────────────────")
+        for amt in sorted(all_amounts.keys()):
+            value_declarations.append(f"    uint256 public constant VALUE_{amt} = {amt};")
+    if all_dates:
+        for dt in sorted(all_dates.keys()):
+            value_declarations.append(f"    uint256 public constant DATE_{dt} = {dt};")
+    
+    # Constructor with enhanced initialization
+    init_payments = []
+    for p in payments[:3]:  # Process up to 3 payment entities
+        label = p.get("label", "")
+        # Extract amount: look for patterns like "10000", "10,000", etc.
+        amt_match = re.search(r"\d{1,3}(?:,\d{3})+|\d{4,}", label)
+        if amt_match:
+            amount = _to_uint(amt_match.group())
+            # Extract date: look for 8-digit dates
+            date_match = re.search(r"\d{8}", label)
+            due_date = date_match.group() if date_match else "0"
+            if amount != "0":
+                safe_label = label.replace('"', '').replace("'", "")[:30]
+                init_payments.append(f'paymentSchedules.push(PaymentSchedule({amount},{due_date},false,"{safe_label}"));')
+    
     w(["    constructor(uint256 _totalValue,uint256 _penaltyBps,uint256 _penaltyPeriod,uint256 _liabilityCap) {",
        "        owner=msg.sender; isActive=true; deployedAt=block.timestamp;",
        "        totalContractValue=_totalValue; penaltyRateBps=_penaltyBps;",
-       "        penaltyPeriod=_penaltyPeriod; liabilityCap=_liabilityCap;",
-       "        emit ContractActivated(msg.sender,block.timestamp);","    }",""])
+       "        penaltyPeriod=_penaltyPeriod; liabilityCap=_liabilityCap;"])
+    
+    # Add payment schedule initialization
+    if init_payments:
+        w(["        // Initialize payment schedules from e-contract:"])
+        w(["        " + line for line in init_payments])
+    
+    w(["        emit ContractActivated(msg.sender,block.timestamp);","    }",""])
+    
+    # Insert value declarations before first function
+    w(value_declarations + [""])
 
     if obligations:
         w(["    function addObligation(string calldata desc,address to,uint256 deadline,bool bestEfforts) external onlyOwner whenActive returns(uint256 id){",

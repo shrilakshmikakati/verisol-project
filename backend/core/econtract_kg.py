@@ -180,7 +180,33 @@ def extract_text_from_image(path: str) -> str:
 def extract_text_from_file(path: str) -> str:
     ext = Path(path).suffix.lower()
     if ext == ".docx":
-        return extract_text_from_docx(path)
+        # Try multiple extraction methods and use the longest result
+        methods = [extract_text_from_docx]
+        try:
+            import zipfile
+            # Alternative method 1: direct zipfile extraction
+            def alt1(p):
+                with zipfile.ZipFile(p) as z:
+                    xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
+                    return re.sub(r'<[^>]+>', ' ', xml)
+            methods.append(alt1)
+        except:
+            pass
+        
+        results = []
+        for method in methods:
+            try:
+                text = method(path)
+                if text and len(text.strip()) > 100:
+                    results.append(text)
+            except:
+                pass
+        
+        if results:
+            # Return longest extraction
+            return max(results, key=lambda x: len(x.replace('\n', '').replace(' ', '')))
+        return ""
+    
     if ext in (".png", ".jpg", ".jpeg", ".tiff", ".bmp"):
         return extract_text_from_image(path)
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -196,10 +222,21 @@ def extract_text_from_folder(folder: str) -> str:
 # ── Preprocessing ──────────────────────────────────────────────────────────────
 
 def preprocess_text(text: str) -> str:
+    """Clean text: remove XML garbage but KEEP dates with 8 digits, fix quotes."""
+    # Remove MULTIPLE 6+ digit sequences (XML artifacts: "640490    193675", etc.)
+    # This handles: 640490    193675 (paired) or 640490    193675    ... (multiple)
+    text = re.sub(r'(?:\d{6,}\s+)+\d{6,}', '', text)
+    # Remove any remaining isolated 6-digit sequences that aren't part of dates
+    # Negative lookbehind/lookahead to avoid breaking DDMMYYYY dates
+    text = re.sub(r'(?<!\d)\d{6}(?![\d/\-])', '', text)
+    # Fix smart quotes
     text = text.replace("\u2019","'").replace("\u2018","'")
     text = text.replace("\u201c",'"').replace("\u201d",'"')
     text = text.replace("\u2013","-").replace("\u2014"," - ")
-    text = re.sub(r"\s+", " ", text)
+    # Remove XML entity codes
+    text = re.sub(r'&#?\w+;', '', text)
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def _ascii_label(s: str) -> str:
@@ -314,16 +351,19 @@ PAYMENT_PATTERNS = [
 ]
 
 DATE_PATTERNS = [
-    r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b",
-    r"\b\d{4}-\d{2}-\d{2}\b",
-    r"\b\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-    r"\s+\d{4}\b",
+    # Standard formats
+    r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b",  # DD/MM/YYYY or DD-MM-YY
+    r"\b\d{4}-\d{2}-\d{2}\b",  # YYYY-MM-DD
+    # DDMMYYYY format - match even when concatenated to text
+    r"(?:0[1-9]|[12]\d|3[01])(?:0[1-9]|1[0-2])(?:19|20)\d{2}",
+    # Named dates
+    r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b",
     r"\b(?:January|February|March|April|May|June|July|August|"
     r"September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
-    r"\bwithin\s+\d+\s+(?:calendar\s+|business\s+)?(?:days?|weeks?|months?)\b",
-    r"\b(?:effective|commencement|expiry|joining|reporting|start|end)\s+date\b",
-    r"\bon\s+or\s+before\s+[\d\/\-]+\b",
+    # Relative dates (days, weeks, months)
+    r"\b\d+\s+(?:calendar\s+)?(?:days?|business\s+days?|weeks?|months?|years?)\b",
+    # Date keywords alone
+    r"\b(?:effective|commencement|expiry|joining|reporting|start|end|before|after|during)\s+date\b",
 ]
 
 DISPUTE_PATTERNS   = [
@@ -527,6 +567,7 @@ def _fuzzy_node_lookup(phrase: str, node_idx: dict) -> str | None:
     return None
 
 def extract_semantic_edges(text: str, G: nx.DiGraph):
+    """Extract semantic edges via verb-based dependency parsing only."""
     nlp      = get_nlp()
     node_idx = _build_node_index(G)
 
@@ -537,21 +578,18 @@ def extract_semantic_edges(text: str, G: nx.DiGraph):
         verbs  = [t for t in tokens if t.pos_ == "VERB"]
 
         for subj in subjs:
-            # Use subject subtree phrase for richer matching
-            subj_phrase = " ".join(
-                t.text for t in subj.subtree
-                if t.pos_ in ("NOUN", "PROPN", "ADJ") or t == subj
-            )
-            src = _fuzzy_node_lookup(subj_phrase, node_idx) or \
-                  _fuzzy_node_lookup(subj.text, node_idx)
+            subj_phrase = " ".join(t.text for t in subj.subtree
+                                   if t.pos_ in ("NOUN", "PROPN", "ADJ") or t == subj)
+            src = _fuzzy_node_lookup(subj_phrase, node_idx) or _fuzzy_node_lookup(subj.text, node_idx)
             if not src:
                 continue
 
             verb = min(verbs, key=lambda v: abs(v.i - subj.i), default=None)
             if not verb:
                 continue
-            lemma     = verb.lemma_.lower()
-            neg       = any(c.dep_ == "neg" for c in verb.children)
+            
+            lemma = verb.lemma_.lower()
+            neg = any(c.dep_ == "neg" for c in verb.children)
             sem_label = SEMANTIC_VERB_MAP.get(lemma)
             if not sem_label:
                 continue
@@ -559,27 +597,24 @@ def extract_semantic_edges(text: str, G: nx.DiGraph):
                 sem_label = "NOT_" + sem_label
 
             for obj in objs:
-                obj_phrase = " ".join(
-                    t.text for t in obj.subtree
-                    if t.pos_ in ("NOUN", "PROPN", "ADJ") or t == obj
-                )
-                tgt = _fuzzy_node_lookup(obj_phrase, node_idx) or \
-                      _fuzzy_node_lookup(obj.text, node_idx)
+                obj_phrase = " ".join(t.text for t in obj.subtree
+                                     if t.pos_ in ("NOUN", "PROPN", "ADJ") or t == obj)
+                tgt = _fuzzy_node_lookup(obj_phrase, node_idx) or _fuzzy_node_lookup(obj.text, node_idx)
                 if tgt and src != tgt and not G.has_edge(src, tgt):
                     G.add_edge(src, tgt, relation=sem_label)
 
 # ── Obligation → Party linking ─────────────────────────────────────────────────
 
 def _link_obligations_to_parties(text: str, G: nx.DiGraph):
-    """
-    For each obligation/condition/termination node, find the party most
-    frequently co-mentioned in the same sentence, add HAS_OBLIGATION edge.
-    """
+    """Link obligations/conditions to parties and payments to parties."""
     party_nodes  = [n for n in G.nodes if G.nodes[n].get("entity_type") == "PARTY"]
+    payment_nodes = [n for n in G.nodes if G.nodes[n].get("entity_type") == "PAYMENT"]
     target_types = {"OBLIGATION", "CONDITION", "TERMINATION"}
     target_nodes = [n for n in G.nodes if G.nodes[n].get("entity_type") in target_types]
 
     sentences = re.split(r"[.;\n]", text)
+    
+    # OBLIGATION/CONDITION/TERMINATION → PARTY edges
     for kw_node in target_nodes:
         kw = kw_node.lower()
         counts: dict = {}
@@ -589,11 +624,8 @@ def _link_obligations_to_parties(text: str, G: nx.DiGraph):
                 continue
             for p in party_nodes:
                 plabel = G.nodes[p].get("label", p).lower()
-                # Match by label, first 5 chars, or any 4-char word in label
                 words = re.findall(r"[a-z]{4,}", plabel)
-                hit   = (plabel in sent_lower or
-                         plabel[:5] in sent_lower or
-                         any(w in sent_lower for w in words))
+                hit = plabel in sent_lower or plabel[:5] in sent_lower or any(w in sent_lower for w in words)
                 if hit:
                     counts[p] = counts.get(p, 0) + 1
         if counts:
@@ -601,20 +633,17 @@ def _link_obligations_to_parties(text: str, G: nx.DiGraph):
             if not G.has_edge(best, kw_node):
                 G.add_edge(best, kw_node, relation="HAS_OBLIGATION")
 
-    # Also: link PAYMENT nodes to PARTY nodes that appear near payment terms
-    payment_nodes = [n for n in G.nodes if G.nodes[n].get("entity_type") == "PAYMENT"]
+    # PAYMENT → PARTY edges
     for pay_node in payment_nodes:
-        pay_kw = re.sub(r"[^a-z0-9]", "", pay_node.lower())
         for sent in sentences:
             if not re.search(r"(?:stipend|salary|pay|receive|payment|rs\.|inr)", sent.lower()):
                 continue
             for p in party_nodes:
                 plabel = G.nodes[p].get("label", p).lower()
-                words  = re.findall(r"[a-z]{4,}", plabel)
-                hit    = plabel in sent.lower() or any(w in sent.lower() for w in words)
+                words = re.findall(r"[a-z]{4,}", plabel)
+                hit = plabel in sent.lower() or any(w in sent.lower() for w in words)
                 if hit and not G.has_edge(p, pay_node):
                     G.add_edge(p, pay_node, relation="RECEIVES")
-                    break
 
 # ── Build KG ───────────────────────────────────────────────────────────────────
 
