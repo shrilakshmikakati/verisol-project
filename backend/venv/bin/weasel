@@ -1,0 +1,6 @@
+#!/home/archikiess/Projects/ContractForge_Terminal/econtract-system/backend/venv/bin/python
+import sys
+from weasel.cli import app
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(app())
