@@ -2,8 +2,9 @@
 """
 ContractForge CLI — E-Contract → Smart Contract (terminal only)
 Usage:
-  python cli.py run   --file contract.txt  --name ServiceAgreement
-  python cli.py run   --file contract.docx --name MyContract --output ./results
+  python cli.py run       --file contract.txt  --name ServiceAgreement
+  python cli.py run       --file contract.docx --name MyContract --output ./results
+  python cli.py run-multi --file multipage.docx --name Contracts
   python cli.py demo
   python cli.py check
 """
@@ -36,10 +37,10 @@ def print_step(icon: str, msg: str):
 
 # ── Banner ─────────────────────────────────────────────────────────────────────
 BANNER = f"""
-{cyan('  ╔══════════════════════════════════════════════════════╗')}
+{cyan('  ╔════════════════════════════════════════════=====================══════════╗')}
 {cyan('  ║')}  {bold('ContractForge')} — E-Contract → Smart Contract CLI      {cyan('║')}
 {cyan('  ║')}  {dim('NLP · Knowledge Graph · Solidity 0.8.16 · qwen2.5:7b')}  {cyan('║')}
-{cyan('  ╚══════════════════════════════════════════════════════╝')}
+{cyan('  ╚════════════════════════════════════════════=====================══════════╝')}
 """
 
 # ── Import backend core (must run from project root or backend/) ──────────────
@@ -99,8 +100,37 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # ── Real Progress Tracking ────────────────────────────────
+    # Base percentages for pipeline sections (adjusted by actual work units)
+    progress_state = {
+        "extraction_pct": 0.0,
+        "ec_kg_pct": 0.0,
+        "solidity_pct": 0.0,
+        "sc_kg_pct": 0.0,
+        "comparison_pct": 0.0,
+        "refinement_pct": 0.0,
+        "final_pct": 0.0,
+        "save_pct": 0.0,
+    }
+    
+    # Track sub-task progress to update main milestone
+    def update_progress():
+        """Calculate overall progress from component percentages."""
+        # Weighted sections of the pipeline
+        overall = (
+            progress_state["extraction_pct"] * 0.05 +      # 5%
+            progress_state["ec_kg_pct"] * 0.20 +           # 20%
+            progress_state["solidity_pct"] * 0.05 +        # 5%
+            progress_state["sc_kg_pct"] * 0.20 +           # 20%
+            progress_state["comparison_pct"] * 0.10 +      # 10%
+            progress_state["refinement_pct"] * 0.25 +      # 25%
+            progress_state["final_pct"] * 0.10 +           # 10%
+            progress_state["save_pct"] * 0.05              # 5%
+        )
+        return max(0, min(100, overall))
+
     # ── Step 1: Extract text ──────────────────────────────────
-    print_progress("Extracting text from e-contract...", 3)
+    print_progress("Extracting text from e-contract...", 1)
     if os.path.isdir(file_path):
         from core.econtract_kg import extract_text_from_folder
         text = extract_text_from_folder(file_path)
@@ -111,6 +141,8 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
         print(f"\n  {red('✗')}  Could not extract text from file.")
         sys.exit(1)
 
+    progress_state["extraction_pct"] = 100.0
+    
     # Quality assessment — a real contract should be 2000+ chars
     chars     = len(text)
     sentences = len(re.findall(r'[.!?]', text))
@@ -139,27 +171,42 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
         print(f"     {dim(pl[:90])}")
 
     # ── Step 2: E-Contract KG ─────────────────────────────────
-    print_progress("Building e-contract knowledge graph (NLP)...", 15)
+    print_progress("Building e-contract knowledge graph (NLP)...", update_progress())
     G_e     = build_econtract_knowledge_graph(text)
     ec_dict = graph_to_dict(G_e)
+    
+    ec_nodes = G_e.number_of_nodes()
+    ec_edges = G_e.number_of_edges()
+    progress_state["ec_kg_pct"] = 100.0  # EC KG is deterministic, finishes as completed
+    
     print_step(cyan("②"), f"E-Contract KG built  "
-               f"{dim(f'{G_e.number_of_nodes()} nodes, {G_e.number_of_edges()} edges')}")
+               f"{dim(f'{ec_nodes} nodes, {ec_edges} edges')}")
     _print_kg_summary(ec_dict, "E-Contract")
 
     # ── Step 3: Generate Solidity ─────────────────────────────
-    print_progress("Generating smart contract from KG...", 38)
+    print_progress("Generating smart contract from KG...", update_progress())
     initial_solidity = kg_to_solidity(ec_dict, contract_name)
-    print_step(cyan("③"), f"Initial Solidity generated  {dim(f'({len(initial_solidity.splitlines())} lines)')}")
+    sol_lines = len(initial_solidity.splitlines())
+    progress_state["solidity_pct"] = 100.0
+    
+    print_step(cyan("③"), f"Initial Solidity generated  {dim(f'({sol_lines} lines)')}")
 
     # ── Step 4: Smart Contract KG ─────────────────────────────
-    print_progress("Building smart contract knowledge graph (AST)...", 55)
+    print_progress("Building smart contract knowledge graph (AST)...", update_progress())
     G_s_init = build_smartcontract_knowledge_graph(initial_solidity)
+    
+    sc_nodes_init = G_s_init.number_of_nodes()
+    sc_edges_init = G_s_init.number_of_edges()
+    progress_state["sc_kg_pct"] = 100.0  # SC KG is deterministic from input Solidity
+    
     print_step(cyan("④"), f"Smart Contract KG built  "
-               f"{dim(f'{G_s_init.number_of_nodes()} nodes, {G_s_init.number_of_edges()} edges')}")
+               f"{dim(f'{sc_nodes_init} nodes, {sc_edges_init} edges')}")
 
     # ── Step 5: Initial comparison ────────────────────────────
-    print_progress("Comparing knowledge graphs...", 65)
+    print_progress("Comparing knowledge graphs...", update_progress())
     initial_cmp = compare_knowledge_graphs(G_e, G_s_init, initial_solidity)
+    progress_state["comparison_pct"] = 100.0
+    
     print_step(cyan("⑤"), "KG Comparison (initial)")
     _print_comparison(initial_cmp, "Initial")
 
@@ -170,42 +217,52 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
     iterations_used = 0
 
     if not initial_cmp["is_valid"]:
+        print_progress("Starting LLM refinement...", update_progress())
         print_step(yellow("⑥"), f"Accuracy {initial_cmp['accuracy']}% < 100% — starting LLM refinement (max 5 iterations)...")
         final_solidity, llm_history, iterations_used = _refinement_with_progress(
-            initial_solidity, text, G_e, refinement_loop
+            initial_solidity, text, G_e, refinement_loop, progress_state, update_progress
         )
         history.extend(llm_history)
+        progress_state["refinement_pct"] = 100.0
     else:
         print_step(green("⑥"), "Accuracy 100% — no LLM refinement needed!")
+        progress_state["refinement_pct"] = 100.0
 
     # ── Step 7: Final KG + comparison ────────────────────────
-    print_progress("Building final smart contract KG...", 90)
+    print_progress("Building final smart contract KG...", update_progress())
     G_s_final    = build_smartcontract_knowledge_graph(final_solidity)
-
+    progress_state["final_pct"] = 100.0
 
     final_cmp = compare_knowledge_graphs(G_e, G_s_final, final_solidity)
     print_step(cyan("⑦"), "KG Comparison (final)")
     _print_comparison(final_cmp, "Final")
 
     # ── Save outputs ──────────────────────────────────────────
-    print_progress("Saving output files...", 95)
+    print_progress("Saving output files...", update_progress())
 
     sol_path = out / f"{contract_name}.sol"
     sol_path.write_text(final_solidity, encoding="utf-8")
+    progress_state["save_pct"] = 33.0
 
+    print_progress(f"Saving results.json...", update_progress())
     results = _build_results_dict(
         contract_name, file_path, initial_cmp, final_cmp, history, iterations_used
     )
     json_path = out / "results.json"
     json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    progress_state["save_pct"] = 66.0
 
+    print_progress(f"Copying original contract...", update_progress())
     # Copy original e-contract
     orig_dest = out / ("econtract" + Path(file_path).suffix)
     try:
         shutil.copy2(file_path, orig_dest)
     except Exception:
         pass
+    progress_state["save_pct"] = 100.0
 
+    # Mark pipeline as 100% complete
+    print_progress("Pipeline complete!", 100)
 
     # ── Final summary ─────────────────────────────────────────
     print(f"\n\n{'─'*60}")
@@ -239,8 +296,24 @@ def _print_kg_summary(kg: dict, label: str):
 
 def _print_comparison(cmp: dict, label: str):
     acc   = cmp["accuracy"]
+    base_acc = cmp.get("base_accuracy", acc)
+    completeness = cmp.get("completeness", 100.0)
+    status = cmp.get("completeness_status", "")
+    
+    # Color based on final accuracy
     color = green if acc >= 100 else yellow if acc >= 70 else red
-    print(f"     {bold('Accuracy')}       {color(str(round(acc,1)) + "%")}")
+    
+    # Show completeness penalty only if final accuracy is not 100%
+    if acc >= 100:
+        # Perfect match - all metrics at 100%
+        print(f"     {bold('Accuracy')}       {color(str(round(acc,1)) + "%")}")
+    elif completeness < 100:
+        # Incomplete extraction - show the penalty formula
+        print(f"     {bold('Accuracy')}       {color(str(round(acc,1)) + "%")}  {yellow(f'(base: {round(base_acc,1)}% × completeness: {round(completeness,1)}% = {round(acc,1)}%)')}")
+        print(f"     {red(status)} — E-Contract KG has only {cmp['ec_node_count']} nodes (expected ≥10 for complete extraction)")
+    else:
+        print(f"     {bold('Accuracy')}       {color(str(round(acc,1)) + "%")}")
+    
     node_s = str(round(cmp["node_similarity"], 1)) + "%"
     edge_s = str(round(cmp["edge_similarity"], 1)) + "%"
     type_s = str(round(cmp["type_coverage"]["type_coverage_pct"], 1)) + "%"
@@ -262,7 +335,7 @@ def _print_comparison(cmp: dict, label: str):
 
 
 
-def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn):
+def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn, progress_state, update_progress_fn):
     """Delegates to the additive patch refinement_loop; shows per-iter progress."""
     from backend.core.kg_comparison import refinement_loop
     import threading
@@ -280,11 +353,11 @@ def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn):
     
     thread = threading.Thread(target=run_refinement, daemon=False)
     thread.start()
-    thread.join(timeout=120)  # 2 minute timeout
+    thread.join(timeout=300)  # 5 minute timeout for refinement loop
     
     # If refinement timed out or errored, just use initial solidity
     if thread.is_alive():
-        print(dim("     [Refinement timeout after 120s — using initial solidity]"))
+        print(dim("     [Refinement timeout after 300s — using initial solidity]"))
         return initial_solidity, [], 0
     
     if error[0]:
@@ -316,6 +389,11 @@ def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn):
               "  nodes=" + cyan(str(h["sc_nodes"])) +
               "  patch=" + (green("YES") if patch else dim("NO")) +
               "  " + status)
+        
+        # Update refinement progress based on iteration completion
+        if iters_used > 0:
+            progress_state["refinement_pct"] = (i / iters_used) * 100.0
+            print_progress(f"Refinement iteration {i}/{iters_used}...", update_progress_fn())
 
     return final_code, history, iters_used
 
@@ -325,7 +403,7 @@ def _build_results_dict(name, file_path, initial_cmp, final_cmp, history, iterat
     return {
         "contract_name":    name,
         "source_file":      str(file_path),
-        "generated_at":     datetime.datetime.utcnow().isoformat() + "Z",
+        "generated_at":     datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
         "solidity_version": "0.8.16",
         "pipeline": {
             "iterations_used": iterations,
@@ -333,6 +411,9 @@ def _build_results_dict(name, file_path, initial_cmp, final_cmp, history, iterat
         },
         "initial_comparison": {
             "accuracy":          initial_cmp.get("accuracy"),
+            "base_accuracy":     initial_cmp.get("base_accuracy"),
+            "completeness":      initial_cmp.get("completeness", 100.0),
+            "completeness_status": initial_cmp.get("completeness_status", "✓ VALID"),
             "node_similarity":   initial_cmp.get("node_similarity"),
             "edge_similarity":   initial_cmp.get("edge_similarity"),
             "type_coverage_pct": initial_cmp.get("type_coverage", {}).get("type_coverage_pct"),
@@ -341,6 +422,9 @@ def _build_results_dict(name, file_path, initial_cmp, final_cmp, history, iterat
         },
         "final_comparison": {
             "accuracy":          final_cmp.get("accuracy"),
+            "base_accuracy":     final_cmp.get("base_accuracy"),
+            "completeness":      final_cmp.get("completeness", 100.0),
+            "completeness_status": final_cmp.get("completeness_status", "✓ VALID"),
             "node_similarity":   final_cmp.get("node_similarity"),
             "edge_similarity":   final_cmp.get("edge_similarity"),
             "type_coverage_pct": final_cmp.get("type_coverage", {}).get("type_coverage_pct"),
@@ -456,6 +540,63 @@ def cmd_demo(args):
     os.unlink(tmp.name)
 
 
+# ── Run multi-page command ────────────────────────────────────────────────────
+def cmd_run_multi(args):
+    """Process multi-page DOCX: generates one smart contract per page/section."""
+    print(BANNER)
+    path = Path(args.file)
+    if not path.exists():
+        print(red(f"  ✗  File not found: {args.file}"))
+        sys.exit(1)
+    
+    # Extract pages from document
+    _setup_path()
+    from core.econtract_kg import extract_pages_from_docx
+    
+    if path.suffix.lower() != ".docx":
+        print(red(f"  ✗  run-multi only supports .docx files (got {path.suffix})"))
+        sys.exit(1)
+    
+    pages = extract_pages_from_docx(str(path))
+    if not pages:
+        print(yellow(f"  ⚠  Document doesn't have multiple pages/sections, using single-page mode"))
+        print(f"     (Use 'python cli.py run' instead)\n")
+        return
+    
+    base_name = args.name or path.stem.replace(" ", "_") or "Contract"
+    base_out  = args.output or f"./contractforge_output/{base_name}_multi"
+    
+    print(f"  {bold('Input')}   {cyan(str(path.resolve()))}")
+    print(f"  {bold('Pages')}   {cyan(str(len(pages)))}")
+    print(f"  {bold('Output')}  {cyan(str(Path(base_out).resolve()))}\n")
+    
+    # Process each page as separate contract
+    for page_num, content, title in pages:
+        page_name = f"{base_name}_page{page_num}"
+        page_out  = f"{base_out}/{page_name}"
+        
+        print(f"\n{cyan('─'*60)}")
+        print(f"  📄  Page {page_num}/{len(pages)}  {dim(title[:40])}")
+        print(f"{cyan('─'*60)}\n")
+        
+        # Create temp file for this page
+        temp_file = Path(page_out) / "temp.txt"
+        temp_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file.write_text(content)
+        
+        try:
+            run_pipeline(str(temp_file), page_name, page_out)
+        except Exception as e:
+            print(red(f"\n  ✗  Error processing page {page_num}: {str(e)[:80]}"))
+            continue
+        finally:
+            # Clean up temp file
+            if temp_file.exists():
+                temp_file.unlink()
+    
+    print(f"\n{green('✓')} All pages processed! Check {base_out} for results.")
+
+
 # ── Run command ───────────────────────────────────────────────────────────────
 def cmd_run(args):
     print(BANNER)
@@ -479,19 +620,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
           Examples:
-            python cli.py run  --file agreement.txt --name ServiceAgreement
-            python cli.py run  --file contract.docx --name NDA --output ./out
-            python cli.py run  --file scan.png      --name ImageContract
+            python cli.py run       --file agreement.txt       --name ServiceAgreement
+            python cli.py run       --file contract.docx       --name NDA --output ./out
+            python cli.py run       --file scan.png            --name ImageContract
+            python cli.py run-multi --file multipage.docx      --name Contracts
             python cli.py demo
             python cli.py check
         """)
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    p_run = sub.add_parser("run", help="Process an e-contract file")
+    p_run = sub.add_parser("run", help="Process a single-page e-contract file")
     p_run.add_argument("--file",   required=True, help="Path to .txt/.docx/.png/.jpg or folder")
     p_run.add_argument("--name",   default="",    help="Contract name (default: filename stem)")
     p_run.add_argument("--output", default="",    help="Output directory (default: ./contractforge_output/<name>)")
+
+    p_multi = sub.add_parser("run-multi", help="Process multi-page DOCX (separate contract per page)")
+    p_multi.add_argument("--file",   required=True, help="Path to .docx file with multiple pages/sections")
+    p_multi.add_argument("--name",   default="",    help="Base contract name for all pages")
+    p_multi.add_argument("--output", default="",    help="Output directory (default: ./contractforge_output/<name>_multi)")
 
     p_demo = sub.add_parser("demo", help="Run with built-in sample contract")
     p_demo.add_argument("--output", default="./contractforge_output/demo", help="Output directory")
@@ -499,10 +646,11 @@ def main():
     sub.add_parser("check", help="Check all dependencies are installed")
 
     args = parser.parse_args()
-    if   args.cmd == "run":   cmd_run(args)
-    elif args.cmd == "demo":  cmd_demo(args)
-    elif args.cmd == "check": cmd_check(args)
-    else:                     parser.print_help()
+    if   args.cmd == "run":       cmd_run(args)
+    elif args.cmd == "run-multi": cmd_run_multi(args)
+    elif args.cmd == "demo":      cmd_demo(args)
+    elif args.cmd == "check":     cmd_check(args)
+    else:                         parser.print_help()
 
 
 if __name__ == "__main__":

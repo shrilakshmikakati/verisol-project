@@ -9,7 +9,8 @@ Improvements in this version:
  - _link_obligations_to_parties uses sentence-window proximity
  - Party pattern min-length enforced (>= 3 chars after blocklist)
 """
-import re, io, base64, warnings
+import re, io, base64, warnings, datetime
+from datetime import datetime as dt, timedelta
 import spacy
 import networkx as nx
 import matplotlib
@@ -212,6 +213,112 @@ def extract_text_from_file(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
+def extract_pages_from_docx(path: str) -> list:
+    """
+    Extract pages/sections from multi-page DOCX.
+    Returns list of (page_num, content, title) tuples
+    
+    Detection strategy (in order of preference):
+    1. Heading styles (Heading 1, 2, 3, etc.) - must have 2+
+    2. Title-style paragraphs - must have 2+
+    3. Physical page estimation (adaptively: document_chars / 7 sections as default)
+    """
+    try:
+        from docx import Document
+    except:
+        return []
+    
+    doc = Document(path)
+    if not doc.paragraphs:
+        return []
+    
+    # Strategy 1: Detect explicit heading styles
+    heading_markers = []
+    for i, para in enumerate(doc.paragraphs):
+        style = para.style.name if para.style else ""
+        text = para.text.strip()
+        
+        # Only Heading 1, 2, 3 - stricter filtering
+        if any(h in style for h in ["Heading 1", "Heading 2", "Heading 3"]) and text:
+            heading_markers.append((i, text))
+    
+    # Use headings ONLY if:
+    # 1. We have 3+ distinct heading markers, OR
+    # 2. We have 2+ headings with significantly different text (not duplicates)
+    use_headings = False
+    if len(heading_markers) >= 3:
+        use_headings = True
+    elif len(heading_markers) == 2:
+        # Check if headers are meaningfully different
+        h1_text = heading_markers[0][1]
+        h2_text = heading_markers[1][1]
+        if h1_text != h2_text:  # Only use if headers are different
+            use_headings = True
+    
+    if use_headings:
+        pages = []
+        for section_idx, (start_idx, title_text) in enumerate(heading_markers):
+            next_idx = heading_markers[section_idx + 1][0] if section_idx + 1 < len(heading_markers) else len(doc.paragraphs)
+            
+            section_text = []
+            for para_idx in range(start_idx, next_idx):
+                para = doc.paragraphs[para_idx]
+                if para.text.strip():
+                    section_text.append(para.text)
+            
+            if section_text:
+                content = "\n".join(section_text)
+                pages.append((section_idx + 1, content, title_text[:50]))
+        
+        return pages
+    
+    # Strategy 2: Physical page estimation with adaptive chunking
+    # Calculate total chars and estimate pages based on document structure
+    total_chars = sum(len(p.text) for p in doc.paragraphs)
+    num_word_sections = len(doc.sections) if hasattr(doc, 'sections') else 1
+    
+    # Estimate: if doc has multiple Word sections, aim to create one contract per section
+    # Word sections often correspond to page breaks or logical document divisions
+    if num_word_sections >= 3:
+        # For documents with 3+ sections, split to roughly match section count
+        # chars_per_page = total_chars / num_sections (rounded up to minimum 300)
+        chars_per_page = max(300, total_chars // num_word_sections)
+    elif num_word_sections == 2:
+        # For documents with 2 sections, create 2 pages
+        chars_per_page = max(400, total_chars // 2)
+    elif total_chars > 5000:
+        # Large docs without sections: use 2000 chars per page
+        chars_per_page = 2000
+    else:
+        # Small docs: more granular splitting (1000 chars per page)
+        chars_per_page = 1000
+    
+    pages = []
+    current_page = []
+    page_num = 1
+    page_char_count = 0
+    
+    for para in doc.paragraphs:
+        if para.text.strip():
+            current_page.append(para.text)
+            page_char_count += len(para.text)
+            
+            if page_char_count >= chars_per_page:
+                content = "\n".join(current_page)
+                title = current_page[0][:50] if current_page else f"Page {page_num}"
+                pages.append((page_num, content, title))
+                current_page = []
+                page_char_count = 0
+                page_num += 1
+    
+    # Don't lose the last page
+    if current_page:
+        content = "\n".join(current_page)
+        title = current_page[0][:50] if current_page else f"Page {page_num}"
+        pages.append((page_num, content, title))
+    
+    return pages if len(pages) > 1 else []
+
 def extract_text_from_folder(folder: str) -> str:
     texts = []
     for p in sorted(Path(folder).iterdir()):
@@ -349,6 +456,33 @@ PAYMENT_PATTERNS = [
     # "Rs. 10,000/- per month"
     r"Rs\.?\s*[\d,]+\s*(?:/-\s*)?(?:per\s+month|p\.m\.|/month)",
 ]
+
+def normalize_date(date_str: str) -> str:
+    """Normalize various date formats to YYYY-MM-DD for comparison."""
+    date_str = date_str.strip()
+    
+    # Try DDMMYYYY format (8 consecutive digits)
+    if re.match(r"^\d{8}$", date_str):
+        try:
+            d = dt.strptime(date_str, "%d%m%Y")
+            return d.strftime("%Y-%m-%d")
+        except:
+            pass
+    
+    # Try DD/MM/YYYY or DD-MM-YYYY
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{4}$", date_str):
+        try:
+            d = dt.strptime(date_str.replace("-", "/"), "%d/%m/%Y")
+            return d.strftime("%Y-%m-%d")
+        except:
+            pass
+    
+    # Try YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return date_str
+    
+    # Return as-is if no pattern matched
+    return date_str
 
 DATE_PATTERNS = [
     # Standard formats
@@ -663,9 +797,24 @@ def build_econtract_knowledge_graph(raw_text: str) -> nx.DiGraph:
         val = e["value"].strip()
         if not val:
             continue
-        nid = val[:60]
+        
+        # Normalize date values for better matching
+        if e["type"] == "DATE_DEADLINE":
+            normalized = normalize_date(val)
+            nid = normalized[:60]
+            # Create better labels for dates
+            if re.search(r"\d{8}", val):
+                label = f"date_{normalized}"
+            elif re.search(r"\d+\s+(?:days?|months?|years?|weeks?)", val, re.I):
+                label = f"duration_{nid}"
+            else:
+                label = f"date_{normalized}"
+        else:
+            nid = val[:60]
+            label = nid
+        
         if not G.has_node(nid):
-            G.add_node(nid, entity_type=e["type"], label=nid, lang=lang)
+            G.add_node(nid, entity_type=e["type"], label=label, lang=lang)
 
     extract_semantic_edges(text, G)
     _link_obligations_to_parties(text, G)

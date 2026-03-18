@@ -102,6 +102,39 @@ cmd_run() {
   eval "$PYTHON \"$CLI\" run $py_args"
 }
 
+# ── Multi-page document processing ─────────────────────────────
+cmd_run_multi() {
+  require_venv
+
+  local file="${1:-}"
+  local name="${2:-}"
+  local out="${3:-}"
+
+  # Validate file
+  if [ -z "$file" ]; then
+    error "No file specified."
+    echo -e "  Usage: ${C}./contractforge.sh run-multi <file.docx> [name] [output_dir]${N}"
+    echo -e "  Example: ${D}./contractforge.sh run-multi contracts.docx MyContracts${N}"
+    exit 1
+  fi
+
+  if [ ! -e "$file" ]; then
+    die "File not found: $file"
+  fi
+
+  # Check if file is DOCX
+  if [[ ! "$file" =~ \.docx$ ]]; then
+    warn "run-multi works best with .docx files (multi-page Word documents)"
+  fi
+
+  # Build python args
+  local py_args="--file \"$file\""
+  [ -n "$name" ] && py_args="$py_args --name \"$name\""
+  [ -n "$out"  ] && py_args="$py_args --output \"$out\""
+
+  eval "$PYTHON \"$CLI\" run-multi $py_args"
+}
+
 # ── interactive menu ───────────────────────────────────────────
 interactive_menu() {
   banner
@@ -132,24 +165,28 @@ interactive_menu() {
 
 # ── Entry point ────────────────────────────────────────────────
 case "${1:-}" in
-  run)    shift; cmd_run    "$@" ;;
-  demo)   shift; cmd_demo   "$@" ;;
-  check)  shift; cmd_check        ;;
-  setup)  shift; cmd_setup        ;;
-  "")           interactive_menu  ;;
+  run)       shift; cmd_run       "$@" ;;
+  run-multi) shift; cmd_run_multi "$@" ;;
+  demo)      shift; cmd_demo      "$@" ;;
+  check)     shift; cmd_check           ;;
+  setup)     shift; cmd_setup           ;;
+  "")              interactive_menu     ;;
   *)
     banner
     echo -e "  ${B}Usage:${N}"
-    echo -e "    ${C}./contractforge.sh${N}                            interactive menu"
-    echo -e "    ${C}./contractforge.sh setup${N}                      install dependencies"
-    echo -e "    ${C}./contractforge.sh run <file>${N}                  process e-contract"
-    echo -e "    ${C}./contractforge.sh run <file> <name>${N}           with contract name"
-    echo -e "    ${C}./contractforge.sh run <file> <name> <outdir>${N}  with output dir"
-    echo -e "    ${C}./contractforge.sh demo${N}                        built-in sample"
-    echo -e "    ${C}./contractforge.sh check${N}                       dependency check"
+    echo -e "    ${C}./contractforge.sh${N}                                interactive menu"
+    echo -e "    ${C}./contractforge.sh setup${N}                          install dependencies"
+    echo -e "    ${C}./contractforge.sh run <file>${N}                      process single e-contract"
+    echo -e "    ${C}./contractforge.sh run <file> <name>${N}               with contract name"
+    echo -e "    ${C}./contractforge.sh run <file> <name> <outdir>${N}     with output dir"
+    echo -e "    ${C}./contractforge.sh run-multi <file.docx>${N}           process multi-page DOCX (one contract per page)"
+    echo -e "    ${C}./contractforge.sh run-multi <file> <name>${N}         with base name for pages"
+    echo -e "    ${C}./contractforge.sh demo${N}                            built-in sample"
+    echo -e "    ${C}./contractforge.sh check${N}                           dependency check"
     echo ""
     echo -e "  ${B}Supported input formats:${N}"
-    echo -e "    ${D}.txt  .docx  .png  .jpg  .jpeg  folder/${N}"
+    echo -e "    ${D}Single-page: .txt  .docx  .png  .jpg  .jpeg  folder/${N}"
+    echo -e "    ${D}Multi-page:  .docx (detects and splits automatically)${N}"
     echo ""
     ;;
 esac
