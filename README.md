@@ -1,4 +1,4 @@
-# ContractForge — Terminal CLI
+# Verisol — Terminal CLI
 
 Convert e-contracts to Solidity smart contracts entirely from the terminal.
 No GUI, no browser — just a shell script.
@@ -99,4 +99,3 @@ econtract-system/
 │   └── run.py
 └── README.md
 ```
-# verisol-project
