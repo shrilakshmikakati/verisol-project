@@ -45,9 +45,23 @@ cmd_setup() {
   [ -d "$BACKEND_DIR" ] || die "backend/ directory not found. Run from econtract-system/ root."
 
   info "Creating Python virtual environment..."
+  python3 -m venv "$VENV" || die "Failed to create venv. Is python3-venv installed?"
   success "venv created at $VENV"
 
+  info "Upgrading pip..."
+  "$PYTHON" -m pip install --upgrade pip --quiet
 
+  if [ -f "$BACKEND_DIR/requirements.txt" ]; then
+    info "Installing Python dependencies from requirements.txt..."
+    "$PYTHON" -m pip install -r "$BACKEND_DIR/requirements.txt" --quiet && \
+      success "Dependencies installed" || warn "Some packages failed — check requirements.txt"
+  else
+    info "No requirements.txt found — installing core packages..."
+    "$PYTHON" -m pip install spacy networkx matplotlib python-docx requests solcx --quiet && \
+      success "Core packages installed" || warn "Some packages failed"
+    "$PYTHON" -m spacy download en_core_web_sm --quiet 2>/dev/null && \
+      success "spaCy model en_core_web_sm installed" || warn "spaCy model install skipped"
+  fi
 
   info "Installing Solidity compiler 0.8.16..."
   "$PYTHON" -c "import solcx; solcx.install_solc('0.8.16', show_progress=False)" 2>/dev/null && \

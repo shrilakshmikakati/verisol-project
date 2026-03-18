@@ -218,14 +218,15 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
 
     if not initial_cmp["is_valid"]:
         print_progress("Starting LLM refinement...", update_progress())
-        print_step(yellow("⑥"), f"Accuracy {initial_cmp['accuracy']}% < 100% — starting LLM refinement (max 5 iterations)...")
+        acc_now = initial_cmp['accuracy']
+        print_step(yellow("⑥"), f"Accuracy {acc_now}% < 85% or missing types — starting LLM refinement (max 5 iterations)...")
         final_solidity, llm_history, iterations_used = _refinement_with_progress(
             initial_solidity, text, G_e, refinement_loop, progress_state, update_progress
         )
         history.extend(llm_history)
         progress_state["refinement_pct"] = 100.0
     else:
-        print_step(green("⑥"), "Accuracy 100% — no LLM refinement needed!")
+        print_step(green("⑥"), f"Accuracy {initial_cmp['accuracy']}% ≥ 85% with full type coverage — validated, no LLM refinement needed!")
         progress_state["refinement_pct"] = 100.0
 
     # ── Step 7: Final KG + comparison ────────────────────────
@@ -295,77 +296,79 @@ def _print_kg_summary(kg: dict, label: str):
 
 
 def _print_comparison(cmp: dict, label: str):
-    acc   = cmp["accuracy"]
-    base_acc = cmp.get("base_accuracy", acc)
+    acc          = cmp["accuracy"]
     completeness = cmp.get("completeness", 100.0)
-    status = cmp.get("completeness_status", "")
-    
-    # Color based on final accuracy
-    color = green if acc >= 100 else yellow if acc >= 70 else red
-    
-    # Show completeness penalty only if final accuracy is not 100%
-    if acc >= 100:
-        # Perfect match - all metrics at 100%
-        print(f"     {bold('Accuracy')}       {color(str(round(acc,1)) + "%")}")
-    elif completeness < 100:
-        # Incomplete extraction - show the penalty formula
-        print(f"     {bold('Accuracy')}       {color(str(round(acc,1)) + "%")}  {yellow(f'(base: {round(base_acc,1)}% × completeness: {round(completeness,1)}% = {round(acc,1)}%)')}")
-        print(f"     {red(status)} — E-Contract KG has only {cmp['ec_node_count']} nodes (expected ≥10 for complete extraction)")
-    else:
-        print(f"     {bold('Accuracy')}       {color(str(round(acc,1)) + "%")}")
-    
+    status       = cmp.get("completeness_status", "")
+    is_valid     = cmp.get("is_valid", False)
+
+    # Color: green=validated(≥85%+full types), yellow=partial, red=poor
+    color = green if is_valid else yellow if acc >= 70 else red
+
+    # Accuracy line
+    valid_tag = "  " + green("✓ VALIDATED") if is_valid else ""
+    print("     " + bold("Accuracy") + "       " + color(str(round(acc, 1)) + "%") + valid_tag)
+
+    # Show completeness status only when something is incomplete
+    if completeness < 100.0 and status:
+        print("     " + dim("Completeness") + "    " + (green if completeness >= 100 else yellow)(status))
+
     node_s = str(round(cmp["node_similarity"], 1)) + "%"
     edge_s = str(round(cmp["edge_similarity"], 1)) + "%"
     type_s = str(round(cmp["type_coverage"]["type_coverage_pct"], 1)) + "%"
-    print(f"     Node similarity  {cyan(node_s)}   Edge similarity  {cyan(edge_s)}   Type coverage  {cyan(type_s)}")
+    print("     Node similarity  " + cyan(node_s) + "   Edge similarity  " + cyan(edge_s) + "   Type coverage  " + cyan(type_s))
     tiers = cmp.get("node_tiers", {})
     if tiers:
         ta = str(round(tiers.get("tier_a", 0), 1)) + "%"
         tb = str(round(tiers.get("tier_b", 0), 1)) + "%"
         tc = str(round(tiers.get("tier_c", 0), 1)) + "%"
-        print(f"     {dim("  Node tiers →")}  TypeMatch:{cyan(ta)}  LabelMatch:{cyan(tb)}  ValueCov:{cyan(tc)}")
+        print("     " + dim("  Node tiers →") + "  TypeMatch:" + cyan(ta) + "  LabelMatch:" + cyan(tb) + "  ValueCov:" + cyan(tc))
     missing_types = cmp.get("type_coverage", {}).get("missing_semantic", [])
     if missing_types:
-        print(f"     {yellow('Missing types:')}  {dim(", ".join(missing_types))}")
+        print("     " + yellow("Missing types:") + "  " + dim(", ".join(missing_types)))
     unmatched = [n for n in cmp.get("unmatched_nodes", []) if n and len(n) > 2]
     if unmatched:
         shown = ", ".join(unmatched[:5])
-        extra = f" +{len(unmatched)-5} more" if len(unmatched) > 5 else ""
-        print(f"     {yellow('Unmatched:')}  {dim(shown + extra)}")
+        extra = " +" + str(len(unmatched) - 5) + " more" if len(unmatched) > 5 else ""
+        print("     " + yellow("Unmatched:") + "  " + dim(shown + extra))
 
 
 
 def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn, progress_state, update_progress_fn):
     """Delegates to the additive patch refinement_loop; shows per-iter progress."""
-    from backend.core.kg_comparison import refinement_loop
+    # Import from core (not backend.core) — sys.path is already set to backend/ by _setup_path()
+    from core.kg_comparison import refinement_loop
     import threading
-    print("") 
-    
-    # Run refinement in a thread with timeout
+    print("")
+
+    # Run refinement in a thread with generous timeout.
+    # MAX_ITERATIONS=5 × 60s Ollama timeout × 2 retries = 600s theoretical max.
+    # We allow 660s (11 min) and warn the user if it stalls.
+    THREAD_TIMEOUT = 660
     result = [None, None, 0]  # [final_code, history, iters_used]
-    error = [None]
-    
+    error  = [None]
+
     def run_refinement():
         try:
             result[0], result[1], result[2] = refinement_loop(initial_solidity, text, G_e)
         except Exception as e:
             error[0] = e
-    
+
     thread = threading.Thread(target=run_refinement, daemon=False)
     thread.start()
-    thread.join(timeout=300)  # 5 minute timeout for refinement loop
-    
-    # If refinement timed out or errored, just use initial solidity
+    thread.join(timeout=THREAD_TIMEOUT)
+
+    # If refinement timed out, warn explicitly so the user knows the output is unrefined
     if thread.is_alive():
-        print(dim("     [Refinement timeout after 300s — using initial solidity]"))
+        print(yellow(f"     ⚠  Refinement timed out after {THREAD_TIMEOUT}s — output is the initial (unrefined) contract."))
+        print(yellow("     ⚠  Check that Ollama is running: ollama serve"))
         return initial_solidity, [], 0
-    
+
     if error[0]:
-        print(yellow(f"     ⚠ Refinement error: {error[0]} — using initial solidity"))
+        print(yellow(f"     ⚠  Refinement error: {error[0]} — using initial solidity"))
         return initial_solidity, [], 0
-    
+
     final_code, history, iters_used = result
-    
+
     if final_code is None:
         return initial_solidity, [], 0
 
@@ -375,7 +378,7 @@ def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn, p
         banked   = h.get("banked", acc)
         improved = h.get("improved", False)
         patch    = h.get("patch_applied", False)
-        color    = green if acc >= 100 else yellow if acc >= 70 else red
+        color    = green if acc >= 85 else yellow if acc >= 70 else red
         b_color  = green if improved else dim
 
         status   = green("✓ DONE")       if h["is_valid"]  else (
@@ -389,7 +392,7 @@ def _refinement_with_progress(initial_solidity, text, G_e, refinement_loop_fn, p
               "  nodes=" + cyan(str(h["sc_nodes"])) +
               "  patch=" + (green("YES") if patch else dim("NO")) +
               "  " + status)
-        
+
         # Update refinement progress based on iteration completion
         if iters_used > 0:
             progress_state["refinement_pct"] = (i / iters_used) * 100.0
@@ -410,31 +413,31 @@ def _build_results_dict(name, file_path, initial_cmp, final_cmp, history, iterat
             "llm_model":       "qwen2.5:7b",
         },
         "initial_comparison": {
-            "accuracy":          initial_cmp.get("accuracy"),
-            "base_accuracy":     initial_cmp.get("base_accuracy"),
-            "completeness":      initial_cmp.get("completeness", 100.0),
-            "completeness_status": initial_cmp.get("completeness_status", "✓ VALID"),
-            "node_similarity":   initial_cmp.get("node_similarity"),
-            "edge_similarity":   initial_cmp.get("edge_similarity"),
-            "type_coverage_pct": initial_cmp.get("type_coverage", {}).get("type_coverage_pct"),
-            "ec_nodes":          initial_cmp.get("ec_node_count"),
-            "sc_nodes":          initial_cmp.get("sc_node_count"),
+            "accuracy":            initial_cmp.get("accuracy"),
+            "base_accuracy":       initial_cmp.get("base_accuracy"),
+            "completeness":        initial_cmp.get("completeness", 100.0),
+            "completeness_status": initial_cmp.get("completeness_status", "✓ VALIDATED (100%)"),
+            "node_similarity":     initial_cmp.get("node_similarity"),
+            "edge_similarity":     initial_cmp.get("edge_similarity"),
+            "type_coverage_pct":   initial_cmp.get("type_coverage", {}).get("type_coverage_pct"),
+            "ec_nodes":            initial_cmp.get("ec_node_count"),
+            "sc_nodes":            initial_cmp.get("sc_node_count"),
         },
         "final_comparison": {
-            "accuracy":          final_cmp.get("accuracy"),
-            "base_accuracy":     final_cmp.get("base_accuracy"),
-            "completeness":      final_cmp.get("completeness", 100.0),
-            "completeness_status": final_cmp.get("completeness_status", "✓ VALID"),
-            "node_similarity":   final_cmp.get("node_similarity"),
-            "edge_similarity":   final_cmp.get("edge_similarity"),
-            "type_coverage_pct": final_cmp.get("type_coverage", {}).get("type_coverage_pct"),
-            "ec_nodes":          final_cmp.get("ec_node_count"),
-            "sc_nodes":          final_cmp.get("sc_node_count"),
-            "ec_edges":          final_cmp.get("ec_edge_count"),
-            "sc_edges":          final_cmp.get("sc_edge_count"),
-            "matched_nodes":     final_cmp.get("matched_nodes", []),
-            "unmatched_nodes":   final_cmp.get("unmatched_nodes", []),
-            "is_validated":      final_cmp.get("is_valid", False),
+            "accuracy":            final_cmp.get("accuracy"),
+            "base_accuracy":       final_cmp.get("base_accuracy"),
+            "completeness":        final_cmp.get("completeness", 100.0),
+            "completeness_status": final_cmp.get("completeness_status", "✓ VALIDATED (100%)"),
+            "node_similarity":     final_cmp.get("node_similarity"),
+            "edge_similarity":     final_cmp.get("edge_similarity"),
+            "type_coverage_pct":   final_cmp.get("type_coverage", {}).get("type_coverage_pct"),
+            "ec_nodes":            final_cmp.get("ec_node_count"),
+            "sc_nodes":            final_cmp.get("sc_node_count"),
+            "ec_edges":            final_cmp.get("ec_edge_count"),
+            "sc_edges":            final_cmp.get("sc_edge_count"),
+            "matched_nodes":       final_cmp.get("matched_nodes", []),
+            "unmatched_nodes":     final_cmp.get("unmatched_nodes", []),
+            "is_validated":        final_cmp.get("is_valid", False),
         },
         "refinement_history": history,
     }
@@ -478,23 +481,24 @@ def _print_final_summary(cmp, iterations, out, sol_path):
     acc   = cmp["accuracy"]
     valid = cmp["is_valid"]
     color = green if valid else yellow
+    type_cov_pct = cmp.get("type_coverage", {}).get("type_coverage_pct", 0)
 
-    print(f"\n  {bold('RESULTS')}\n")
-    print(f"  {'Accuracy':<22} {color(bold(f'{acc:.1f}%'))}")
-    print(f"  {'Status':<22} {green('✓ VALIDATED') if valid else yellow('⚠ APPROXIMATE')}")
-    print(f"  {'LLM iterations':<22} {cyan(str(iterations))}")
-    print(f"  {'EC nodes':<22} {dim(str(cmp['ec_node_count']))}   "
-          f"SC nodes  {dim(str(cmp['sc_node_count']))}")
-    print(f"\n  {bold('OUTPUT FILES')}\n")
-    
+    print("\n  " + bold("RESULTS") + "\n")
+    print("  " + "Accuracy".ljust(22) + " " + color(bold(str(round(acc, 1)) + "%")))
+    print("  " + "Type coverage".ljust(22) + " " + (green if type_cov_pct >= 100 else yellow)(str(round(type_cov_pct, 1)) + "%"))
+    print("  " + "Status".ljust(22) + " " + (green("✓ VALIDATED") if valid else yellow("⚠ NEEDS REFINEMENT")))
+    print("  " + "LLM iterations".ljust(22) + " " + cyan(str(iterations)))
+    print("  " + "EC nodes".ljust(22) + " " + dim(str(cmp["ec_node_count"])) + "   SC nodes  " + dim(str(cmp["sc_node_count"])))
+    print("\n  " + bold("OUTPUT FILES") + "\n")
+
     # Find the copied econtract file
     econtract_files = list(out.glob("econtract.*"))
     if econtract_files:
-        print(f"  {green('→')}  Original contract {cyan(str(econtract_files[0]))}")
-    
-    print(f"  {green('→')}  Smart contract    {cyan(str(sol_path))}")
-    print(f"  {green('→')}  Results JSON      {cyan(str(out / 'results.json'))}")
-    print(f"\n{'─'*60}\n")
+        print("  " + green("→") + "  Original contract " + cyan(str(econtract_files[0])))
+
+    print("  " + green("→") + "  Smart contract    " + cyan(str(sol_path)))
+    print("  " + green("→") + "  Results JSON      " + cyan(str(out / "results.json")))
+    print("\n" + "─" * 60 + "\n")
 
 
 # ── Demo command ──────────────────────────────────────────────────────────────

@@ -2,12 +2,106 @@
 Algorithm 2: Smart Contract Generation & KG extraction (AST-driven).
 Handles: arbitration, milestones, payment schedules, pro-rata, conditions,
 carve-outs, confidentiality, force majeure, IP, reasonable-efforts clauses.
+Dynamically extracts: jurisdiction, parties, dates, utilities, currency.
+SECURITY: Implements Checks-Effects-Interactions, safe ETH transfers, input validation.
 pragma solidity ^0.8.16 (pinned).
 """
 import re, os, tempfile
+from datetime import datetime
 import networkx as nx
 
 SOLC_VERSION = "0.8.16"
+
+# ── Dynamic extraction helpers ────────────────────────────────────────
+def _extract_governing_law(nodes: list) -> str:
+    """Dynamically extract governing law from KG nodes."""
+    for node in nodes:
+        label = str(node.get("label", "")).lower()
+        if re.search(r"indian|india", label): return "Indian Law"
+        if re.search(r"english|england|uk|united kingdom", label): return "English Law"
+        if re.search(r"delaware", label): return "Delaware Law"
+        if re.search(r"new york", label): return "New York Law"
+        if re.search(r"california", label): return "California Law"
+    return "Indian Law"  # Default for Indian jurisdiction
+
+def _extract_jurisdiction(nodes: list) -> str:
+    """Dynamically extract jurisdiction/venue from KG nodes."""
+    for node in nodes:
+        label = str(node.get("label", "")) 
+        if re.search(r"bengaluru|bangalore", label, re.I): return "Bangalore/Bengaluru"
+        if re.search(r"mumbai", label, re.I): return "Mumbai"
+        if re.search(r"delhi|new delhi", label, re.I): return "Delhi"
+        if re.search(r"new york", label, re.I): return "New York"
+        if re.search(r"los angeles|california", label, re.I): return "California"
+    return "Indian Courts"  # Default
+
+def _extract_arbitration_body(nodes: list) -> str:
+    """Dynamically extract arbitration body from KG nodes."""
+    for node in nodes:
+        label = str(node.get("label", "")).upper()
+        if re.search(r"\bAAA\b", label): return "AAA"
+        if re.search(r"\bUNCITRAL\b", label): return "UNCITRAL"
+        if re.search(r"\bICC\b", label): return "ICC"
+        if re.search(r"\bARBITRATION", label):
+            if re.search(r"indian", label, re.I): return "DRB (Delhi Seat)"
+    return "arbitration with mutual consent"  # Default
+
+def _extract_contract_dates(nodes: list) -> tuple:
+    """Extract contract start and end dates (DDMMYYYY format)."""
+    dates = []
+    for node in nodes:
+        label = str(node.get("label", ""))
+        # Match DDMMYYYY pattern
+        matches = re.findall(r"(\d{2})(\d{2})(\d{4})", label)
+        for match in matches:
+            day, month, year = match
+            date_str = f"{day}{month}{year}"
+            dates.append(date_str)
+    return tuple(dates[:2]) if len(dates) >= 2 else (None, None)
+
+def _extract_utility_references(nodes: list) -> dict:
+    """Extract utility billing references (BESCOM, BWSSB, etc.)."""
+    utilities = {"electricity": "", "water": "", "gas": "", "phone": ""}
+    for node in nodes:
+        label = str(node.get("label", ""))
+        if re.search(r"BESCOM|electricity|meter", label, re.I):
+            meter_match = re.search(r"[A-Z]{2,}-[A-Z]{2,}-\d+|\d{6,}", label)
+            utilities["electricity"] = meter_match.group() if meter_match else "BESCOM"
+        if re.search(r"BWSSB|water|supply", label, re.I):
+            utilities["water"] = "BWSSB"
+        if re.search(r"gas|lpg", label, re.I):
+            utilities["gas"] = re.search(r"[A-Z0-9\-]+", label).group() or "GAS"
+    return utilities
+
+def _extract_tenant_obligations(nodes: list) -> list:
+    """Extract tenant-specific obligations."""
+    obligations = []
+    for node in nodes:
+        label = str(node.get("label", ""))
+        if re.search(r"sublet|subletting|transfer|assign", label, re.I):
+            obligations.append("NO_SUBLETTING")
+        if re.search(r"structural|alteration|modification", label, re.I):
+            obligations.append("NO_STRUCTURAL_CHANGES")
+        if re.search(r"residential|dwel|use", label, re.I):
+            obligations.append("RESIDENTIAL_USE_ONLY")
+        if re.search(r"maintain|repair|upkeep", label, re.I):
+            obligations.append("MAINTENANCE_REQUIRED")
+    return list(set(obligations))  # Remove duplicates
+
+def _ddmmyyyy_to_timestamp(date_str: str) -> str:
+    """Convert DDMMYYYY to Unix timestamp (start of day)."""
+    if len(date_str) != 8:
+        return "0"
+    try:
+        day, month, year = int(date_str[:2]), int(date_str[2:4]), int(date_str[4:8])
+        if not (1 <= month <= 12 and 1 <= day <= 31 and 1970 <= year <= 2100):
+            return "0"
+        # Convert to Unix timestamp
+        dt_obj = datetime(year, month, day)
+        timestamp = int(dt_obj.timestamp())
+        return str(timestamp)
+    except:
+        return "0"
 
 def _safe_id(s: str, n: int = 32) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", s.strip())[:n].strip("_") or "item"
@@ -21,7 +115,18 @@ def _to_uint(v: str) -> str:
         return p[0] + p[1].ljust(18, "0")[:18]
     return r
 
-def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
+def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: dict = None) -> str:
+    """
+    Generate Solidity contract from knowledge graph.
+    
+    Args:
+        kg: Knowledge graph dictionary with nodes and edges
+        contract_name: Name of the contract
+        party_addresses: Dict mapping party IDs to Ethereum addresses (optional)
+        
+    Returns:
+        Generated Solidity code as string
+    """
     nodes = kg.get("nodes", [])
     name  = re.sub(r"[^A-Za-z0-9]", "", contract_name) or "EContract"
     def by(*t): return [n for n in nodes if n.get("entity_type") in t]
@@ -32,23 +137,26 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
     penalties=by("PENALTY_REMEDY","PENALTY"); disputes=by("DISPUTE_ARBITRATION")
     confidential=by("CONFIDENTIALITY_IP"); force_maj=by("FORCE_MAJEURE")
     
-    # Also check for entity type presence (even if 0 nodes) to ensure all types are covered
-    all_entity_types = {n.get("entity_type", "") for n in nodes if n.get("entity_type")}
-    has_obligations = obligations or "OBLIGATION" in all_entity_types
-    has_conditions = conditions or "CONDITION" in all_entity_types
-    has_terminations = terminations or "TERMINATION" in all_entity_types
-    has_disputes = disputes or "DISPUTE_ARBITRATION" in all_entity_types
-    has_confidential = confidential or "CONFIDENTIALITY_IP" in all_entity_types
-    has_force_maj = force_maj or "FORCE_MAJEURE" in all_entity_types
-    has_payments = (payments or milestones) or ("PAYMENT" in all_entity_types or "MILESTONE" in all_entity_types)
-    has_penalties = penalties or "PENALTY_REMEDY" in all_entity_types
+    # Dynamically extract critical contract metadata
+    governing_law = _extract_governing_law(nodes)
+    jurisdiction = _extract_jurisdiction(nodes)
+    arbitration_body = _extract_arbitration_body(nodes)
+    contract_start_date, contract_end_date = _extract_contract_dates(nodes)
+    utilities = _extract_utility_references(nodes)
+    tenant_obligations = _extract_tenant_obligations(nodes)
+    
+    if party_addresses is None:
+        party_addresses = {}
 
     L=[]; w=L.extend
     w(["// SPDX-License-Identifier: MIT","pragma solidity ^0.8.16;","",
        f"/// @title {name} — Auto-generated from E-Contract KG",
+       f"/// @notice Jurisdiction: {jurisdiction} | Governing Law: {governing_law}",
        f"contract {name} {{","",
        "    address public owner; bool public isActive; bool public isTerminated;",
-       "    bool public forceMajeureActive; uint256 public deployedAt;",""])
+       "    bool public forceMajeureActive; uint256 public deployedAt;",
+       "    uint256 public contractStartDate; uint256 public contractEndDate;",
+       "    string public currency; string public jurisdiction;",""])
 
     seen_p: set = set()
     for i,p in enumerate(parties[:6]):
@@ -56,41 +164,51 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
         w([f"    address public {pid};"])
     w([""])
 
-    if has_payments:
+    if payments or milestones:
         w(["    struct PaymentSchedule { uint256 amount; uint256 dueDate; bool released; string description; }",
            "    PaymentSchedule[] public paymentSchedules;",
            "    uint256 public totalContractValue; uint256 public paidAmount;",""])
-    if has_payments or milestones:
+    
+    # Add utility billing structures if utilities are referenced
+    if utilities and any(utilities.values()):
+        w(["    struct UtilityBilling { string utilityName; string meterId; uint256 lastReading; uint256 currentReading; uint256 amountDue; uint256 dueDate; bool paid; }",
+           "    UtilityBilling[] public utilityBillings;",""])
+    
+    # TenantObligation is RENTAL-SPECIFIC — only emit when sublet/structural/residential
+    # keywords were actually extracted from the e-contract. General obligations (internship,
+    # NDA, service agreements) must NOT get rental boilerplate fields.
+    if tenant_obligations:
+        w(["    enum TenantObligationStatus { PENDING, ACKNOWLEDGED, COMPLIANT, BREACHED }",
+           "    struct TenantObligation { string description; TenantObligationStatus status; uint256 deadline; bool isSubletProhibition; bool isStructuralProhibition; bool isResidentialUseOnly; }",
+           "    mapping(uint256 => TenantObligation) public tenantObligations; uint256 public tenantObligationCount;",""])
+    
+    if milestones:
         w(["    enum MilestoneStatus { PENDING, IN_PROGRESS, COMPLETED, DISPUTED }",
            "    struct Milestone { string name; uint256 dueDate; uint256 paymentIndex; MilestoneStatus status; bool acceptanceSigned; }",
            "    Milestone[] public milestones;",""])
-    if has_obligations:
+    if obligations:
         w(["    enum ObligationStatus { PENDING, FULFILLED, BREACHED, WAIVED }",
            "    struct ObligationRecord { string description; ObligationStatus status; address assignedTo; uint256 deadline; bool bestEfforts; }",
            "    mapping(uint256 => ObligationRecord) public obligationRecords; uint256 public obligationCount;",""])
-    if has_conditions:
+    if conditions:
         w(["    struct ConditionRecord { string description; bool isFulfilled; bool isCarveOut; bool isNested; uint256 parentCondId; }",
            "    mapping(uint256 => ConditionRecord) public conditionRecords; uint256 public conditionCount;",""])
-    if has_penalties:
+    if penalties:
         w(["    uint256 public penaltyRateBps; uint256 public penaltyPeriod; uint256 public liabilityCap; uint256 public accruedPenalties;",""])
-    if has_disputes:
-        arb="ICC"; gl="English Law"
-        for d in disputes:
-            if re.search(r"\bAAA\b",d["id"],re.I): arb="AAA"
-            elif re.search(r"\bUNCITRAL\b",d["id"],re.I): arb="UNCITRAL"
-            if re.search(r"Delaware",d["id"],re.I): gl="Delaware Law"
-            elif re.search(r"New York",d["id"],re.I): gl="New York Law"
-        w([f'    string public constant GOVERNING_LAW = "{gl}";',
-           f'    string public constant ARBITRATION_BODY = "{arb}";',
+    if disputes:
+        w([f'    string public constant GOVERNING_LAW = "{governing_law}";',
+           f'    string public constant JURISDICTION = "{jurisdiction}";',
+           f'    string public constant ARBITRATION_BODY = "{arbitration_body}";',
            "    enum DisputeStatus { NONE, RAISED, MEDIATION, ARBITRATION, RESOLVED }",
            "    struct Dispute { uint256 raisedAt; address raisedBy; string description; DisputeStatus status; string resolution; }",
            "    Dispute[] public disputes;",""])
-    if has_confidential:
+    if confidential:
         w(["    struct ConfidentialityRecord { address disclosingParty; address receivingParty; uint256 disclosedAt; uint256 expiresAt; bool breached; }",
            "    ConfidentialityRecord[] public ndaRecords; mapping(address => bool) public ipAssigned;",""])
 
     # Events
     w(["    event ContractActivated(address indexed by, uint256 at);",
+       "    event FundsDeposited(address indexed from, uint256 amount, uint256 at);",
        "    event ObligationAdded(uint256 indexed id, string desc, bool bestEfforts);",
        "    event ObligationFulfilled(uint256 indexed id, address by);",
        "    event ObligationBreached(uint256 indexed id);",
@@ -109,122 +227,81 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
        "    modifier whenActive() { require(isActive&&!isTerminated,'Not active'); require(!forceMajeureActive,'Force majeure'); _; }",
        f"    modifier onlyParty() {{ require({cond}||msg.sender==owner,'Not a party'); _; }}",""])
 
-    # Constructor + extract ALL numeric values from KG for embedding
-    # Extract amounts and dates from ALL nodes (not just payment nodes)
-    all_amounts = {}  # amount -> count
-    all_dates = {}    # date -> count
-    date_nodes = []   # List of DATE_DEADLINE nodes to create variables for
-    
-    for node in nodes:
-        node_id = node.get("id", "")
-        label = node.get("label", "")
-        entity_type = node.get("entity_type", "")
-        
-        if not label:
-            continue
-        
-        # Track DATE_DEADLINE nodes specifically
-        if entity_type == "DATE_DEADLINE":
-            date_nodes.append((node_id, label))
-        
-        label_str = str(label)
-        
-        # Extract 4+ digit sequences (amounts): "10000", "1,000", etc.
-        amounts = re.findall(r"\d{1,3}(?:,\d{3})+|\d{4,}", label_str)
-        for amt in amounts:
-            normalized = amt.replace(",", "")
-            # Don't extract as amounts if it's clearly a year or date component
-            if len(normalized) <= 4 or (len(normalized) == 4 and normalized.startswith("20")):
-                continue
-            all_amounts[normalized] = all_amounts.get(normalized, 0) + 1
-        
-        # Extract 8-digit sequences (dates like DDMMYYYY or YYYYMMDD)
-        dates = re.findall(r"\d{8}", label_str)
-        for dt in dates:
-            all_dates[dt] = all_dates.get(dt, 0) + 1
-        
-        # Extract dashed dates (YYYY-MM-DD or DD/MM/YYYY, etc.)
-        if entity_type == "DATE_DEADLINE":
-            # Extract YYYY-MM-DD format
-            dashed_dates = re.findall(r"(\d{4})-(\d{2})-(\d{2})", label_str)
-            for y, m, d in dashed_dates:
-                # Convert to YYYYMMDD
-                dt = f"{y}{m}{d}"
-                all_dates[dt] = all_dates.get(dt, 0) + 1
-            
-            # Also try from node_id
-            dashed_id = re.findall(r"(\d{4})-(\d{2})-(\d{2})", node_id)
-            for y, m, d in dashed_id:
-                dt = f"{y}{m}{d}"
-                all_dates[dt] = all_dates.get(dt, 0) + 1
-    
-    # Add state variable declarations for all unique amounts/dates at the top (after events/modifiers, before functions)
-    value_declarations = []
-    value_var_count = 0
-    if all_amounts or all_dates or date_nodes:
-        value_declarations.append("    // ── Values extracted from e-contract ────────────────────────────")
-    
-    # Create explicit variables for all amounts
-    if all_amounts:
-        for amt in sorted(all_amounts.keys()):
-            safe_amt_label = f"amount{amt}"[:32]
-            value_declarations.append(f"    uint256 public {safe_amt_label} = {amt};")
-            value_var_count += 1
-    
-    # Create explicit variables for all dates (from labels)
-    if all_dates:
-        for dt in sorted(all_dates.keys()):
-            safe_date_label = f"deadline{dt}"[:32]
-            value_declarations.append(f"    uint256 public {safe_date_label} = {dt};")
-            value_var_count += 1
-    
-    # Create explicit variables for each date node (ensures all date nodes are covered)
-    seen_date_vars = set()
-    if date_nodes:
-        for node_id, label in date_nodes:
-            # Try to extract date from node ID first (YYYY-MM-DD format)
-            date_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", node_id)
-            if date_match:
-                y, m, d = date_match.groups()
-                dt = f"{y}{m}{d}"
-                var_name = f"deadline{dt}"[:32]
-                if var_name not in seen_date_vars:
-                    value_declarations.append(f"    uint256 public {var_name} = {dt};")
-                    seen_date_vars.add(var_name)
-                    value_var_count += 1
-            else:
-                # Try extracting from label
-                label_date = re.search(r"(\d{4})-(\d{2})-(\d{2})", label)
-                if label_date:
-                    y, m, d = label_date.groups()
-                    dt = f"{y}{m}{d}"
-                    var_name = f"deadline{dt}"[:32]
-                    if var_name not in seen_date_vars:
-                        value_declarations.append(f"    uint256 public {var_name} = {dt};")
-                        seen_date_vars.add(var_name)
-                        value_var_count += 1
-    
     # Constructor with enhanced initialization
+    # Deduplicate payment entries by amount — same Rs. 10,000 from 3 KG nodes must not
+    # produce 3 identical PaymentSchedule entries.
     init_payments = []
-    for p in payments[:3]:  # Process up to 3 payment entities
+    seen_init_amounts: set = set()
+    for p in payments:
         label = p.get("label", "")
-        # Extract amount: look for patterns like "10000", "10,000", etc.
         amt_match = re.search(r"\d{1,3}(?:,\d{3})+|\d{4,}", label)
-        if amt_match:
-            amount = _to_uint(amt_match.group())
-            # Extract date: look for 8-digit dates
-            date_match = re.search(r"\d{8}", label)
-            due_date = date_match.group() if date_match else "0"
-            if amount != "0":
-                safe_label = label.replace('"', '').replace("'", "")[:30]
-                init_payments.append(f'paymentSchedules.push(PaymentSchedule({amount},{due_date},false,"{safe_label}"));')
-    
-    # Only generate constructor if there are penalties or payments/milestones
-    if has_penalties or has_payments:
-        w(["    constructor(uint256 _totalValue,uint256 _penaltyBps,uint256 _penaltyPeriod,uint256 _liabilityCap) {",
-           "        owner=msg.sender; isActive=true; deployedAt=block.timestamp;",
+        if not amt_match:
+            continue
+        amount = _to_uint(amt_match.group())
+        if amount == "0" or amount in seen_init_amounts:
+            continue
+        seen_init_amounts.add(amount)
+        date_match = re.search(r"\d{8}", label)
+        due_date = date_match.group() if date_match else "0"
+        safe_label = label.replace('"', '').replace("'", "")[:30]
+        init_payments.append(f'paymentSchedules.push(PaymentSchedule({amount},{due_date},false,"{safe_label}"));')
+        if len(init_payments) >= 6:
+            break
+
+    # ── Value constants (placed BEFORE constructor per Solidity convention) ──
+    value_declarations = []
+    all_amounts = {}
+    all_dates   = {}
+    for node in nodes:
+        label_str = str(node.get("label", ""))
+        if not label_str:
+            continue
+        for amt in re.findall(r"\d{1,3}(?:,\d{3})+|\d{4,}", label_str):
+            normalized = amt.replace(",", "")
+            all_amounts[normalized] = all_amounts.get(normalized, 0) + 1
+        for dt in re.findall(r"\d{8}", label_str):
+            ts = _ddmmyyyy_to_timestamp(dt)
+            if ts != "0":
+                all_dates[f"DATE_{dt}"] = ts
+    if all_amounts or all_dates:
+        value_declarations.append("    // ── Values extracted from e-contract ────────────────────────────")
+        for amt in sorted(all_amounts.keys()):
+            value_declarations.append(f"    uint256 public constant VALUE_{amt} = {amt};")
+        for date_label, ts in sorted(all_dates.items()):
+            value_declarations.append(f"    uint256 public constant {date_label} = {ts}; // Unix timestamp")
+    if value_declarations:
+        w(value_declarations + [""])
+
+    # Build constructor with party initialization
+    if penalties or payments or milestones or obligations or tenant_obligations:
+        # Create party address parameters for constructor
+        party_params = ", ".join([f"address _{_safe_id(p['id'])}" for p in parties[:6] if _safe_id(p["id"])])
+        if party_params:
+            party_params = ", " + party_params
+        
+        w(["    constructor(",
+           f"        uint256 _totalValue,",
+           f"        uint256 _penaltyBps,",
+           f"        uint256 _penaltyPeriod,",
+           f"        uint256 _liabilityCap{party_params},",
+           f"        string memory _currency,",
+           f"        uint256 _startDate,",
+           f"        uint256 _endDate",
+           "    ) {"])
+        
+        w(["        owner=msg.sender; isActive=true; deployedAt=block.timestamp;",
            "        totalContractValue=_totalValue; penaltyRateBps=_penaltyBps;",
-           "        penaltyPeriod=_penaltyPeriod; liabilityCap=_liabilityCap;"])
+           "        penaltyPeriod=_penaltyPeriod; liabilityCap=_liabilityCap;",
+           "        require(_totalValue>0,'totalValue=0');",
+           "        // penaltyBps=0 is valid for non-penalty contracts (internship, NDA, etc.)",
+           "        currency=_currency; contractStartDate=_startDate; contractEndDate=_endDate;",
+           "        require(_endDate>_startDate,'end<=start');",
+           f'        jurisdiction="{jurisdiction}";'])
+        
+        # Assign party addresses from constructor parameters
+        for i, p in enumerate(parties[:6]):
+            pid = _safe_id(p['id'])
+            w([f"        {pid}=_{pid};"])
         
         # Add payment schedule initialization
         if init_payments:
@@ -233,10 +310,19 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
         
         w(["        emit ContractActivated(msg.sender,block.timestamp);",'    }',''])
     
-    # Insert value declarations before first function
-    w(value_declarations + [""])
+    # Helper function for contract term validation
+    w(["    function isContractTermExpired() external view returns(bool){",
+       "        if(contractEndDate == 0) return false;",
+       "        return block.timestamp > contractEndDate;",
+       "    }",
+       "",
+       "    function getDaysRemaining() external view returns(int256){",
+       "        if(contractEndDate == 0) return -1;",
+       "        int256 remaining = int256(contractEndDate) - int256(block.timestamp);",
+       "        return remaining > 0 ? remaining / 86400 : -1;",
+       "    }",""])
 
-    if has_obligations:
+    if obligations or tenant_obligations:
         w(["    function addObligation(string calldata desc,address to,uint256 deadline,bool bestEfforts) external onlyOwner whenActive returns(uint256 id){",
            "        id=obligationCount++; obligationRecords[id]=ObligationRecord(desc,ObligationStatus.PENDING,to,deadline,bestEfforts);",
            "        emit ObligationAdded(id,desc,bestEfforts);","    }",
@@ -245,43 +331,86 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
            "        obligationRecords[id].status=ObligationStatus.FULFILLED; emit ObligationFulfilled(id,msg.sender);","    }",
            "    function markObligationBreached(uint256 id) external onlyOwner{",
            "        obligationRecords[id].status=ObligationStatus.BREACHED; emit ObligationBreached(id);","    }",""])
+    
+    # Add tenant-specific obligation functions
+    if tenant_obligations or obligations:
+        w(["    function addTenantObligation(string calldata desc,uint256 deadline,bool isSublet,bool isStructural,bool isResidentialOnly) external onlyOwner returns(uint256 id){",
+           "        id=tenantObligationCount++; tenantObligations[id]=TenantObligation(desc,TenantObligationStatus.PENDING,deadline,isSublet,isStructural,isResidentialOnly);","    }",
+           "    function acknowledgeTenantObligation(uint256 id) external whenActive onlyParty{",
+           "        require(tenantObligations[id].status==TenantObligationStatus.PENDING,'Not pending');",
+           "        tenantObligations[id].status=TenantObligationStatus.ACKNOWLEDGED;","    }",
+           "    function markTenantObligationCompliant(uint256 id) external onlyOwner whenActive{",
+           "        if(tenantObligations[id].deadline > 0) require(block.timestamp <= tenantObligations[id].deadline,'Deadline passed');",
+           "        tenantObligations[id].status=TenantObligationStatus.COMPLIANT;","    }",
+           "    function flagTenantObligationBreach(uint256 id) external onlyOwner{",
+           "        tenantObligations[id].status=TenantObligationStatus.BREACHED;","    }",""])
+    
+    # Add utility billing functions if utilities are referenced
+    if utilities and any(utilities.values()):
+        w(["    function recordUtilityBilling(string calldata utilName,string calldata meterId,uint256 currentReading,uint256 amount,uint256 dueDate) external onlyOwner returns(uint256 idx){",
+           "        idx=utilityBillings.length; utilityBillings.push(UtilityBilling(utilName,meterId,0,currentReading,amount,dueDate,false));","    }",
+           "    function markUtilityPaid(uint256 idx) external onlyOwner{",
+           "        utilityBillings[idx].paid=true; paidAmount+=utilityBillings[idx].amountDue;","    }",
+           "    function updateUtilityReading(uint256 idx,uint256 newReading) external onlyOwner{",
+           "        utilityBillings[idx].lastReading=utilityBillings[idx].currentReading;",
+           "        utilityBillings[idx].currentReading=newReading;","    }",""])
 
-    if has_conditions:
+    if conditions:
         w(["    function addCondition(string calldata desc,bool isCarveOut,bool isNested,uint256 parentId) external onlyOwner returns(uint256 id){",
            "        id=conditionCount++; conditionRecords[id]=ConditionRecord(desc,false,isCarveOut,isNested,parentId);","    }",
            "    function fulfillCondition(uint256 id) external onlyOwner whenActive{",
            "        if(conditionRecords[id].isNested) require(conditionRecords[conditionRecords[id].parentCondId].isFulfilled,'Parent not met');",
            "        conditionRecords[id].isFulfilled=true; emit ConditionFulfilled(id);","    }",""])
 
-    if has_payments:
+    if payments or milestones:
         w(["    function addPaymentSchedule(uint256 amount,uint256 dueDate,string calldata desc) external onlyOwner returns(uint256 idx){",
-           "        idx=paymentSchedules.length; paymentSchedules.push(PaymentSchedule(amount,dueDate,false,desc));","    }",
-           "    function releaseScheduledPayment(uint256 idx,address payable recipient) external payable onlyOwner whenActive{",
-           "        PaymentSchedule storage ps=paymentSchedules[idx];",
-           "        require(!ps.released,'Done'); require(msg.value>=ps.amount,'Low');",
-           "        if(ps.dueDate>0) require(block.timestamp>=ps.dueDate,'Not due');",
-           "        ps.released=true; paidAmount+=ps.amount; recipient.transfer(ps.amount);",
-           "        emit PaymentReleased(idx,recipient,ps.amount);","    }",
-           "    function proRataRelease(address payable recipient,uint256 numerator,uint256 denominator) external payable onlyOwner whenActive{",
-           "        require(denominator>0,'Zero denom'); uint256 share=(msg.value*numerator)/denominator;",
-           "        require(share>0,'Zero share'); recipient.transfer(share);","    }",""])
+           "        require(amount>0,'amount=0'); idx=paymentSchedules.length;",
+           "        paymentSchedules.push(PaymentSchedule(amount,dueDate,false,desc));","    }",
+           "    function releaseScheduledPayment(uint256 idx,address payable recipient) external onlyOwner whenActive{",
+           "        require(recipient!=address(0),'zero addr'); PaymentSchedule storage ps=paymentSchedules[idx];",
+           "        require(!ps.released,'already paid'); require(address(this).balance>=ps.amount,'insufficient balance');",
+           "        if(ps.dueDate>0) require(block.timestamp>=ps.dueDate,'not yet due');",
+           "        // CHECKS-EFFECTS-INTERACTIONS: Update state BEFORE external call to prevent reentrancy",
+           "        ps.released=true;",
+           "        paidAmount+=ps.amount;",
+           "        emit PaymentReleased(idx,recipient,ps.amount);",
+           "        // Safe transfer using low-level call (post-EIP-1884)",
+           "        (bool success,)=recipient.call{value:ps.amount}('');",
+           "        require(success,'transfer failed');","    }",
+           "    function proRataRelease(address payable recipient,uint256 numerator,uint256 denominator) external onlyOwner whenActive{",
+           "        require(recipient!=address(0),'zero addr'); require(denominator>0,'denom=0');",
+           "        require(numerator<=denominator,'num>denom'); // Prevent owner from extracting >100%",
+           "        uint256 contractBalance=address(this).balance;",
+           "        require(contractBalance>0,'no funds');",
+           "        uint256 share=(contractBalance*numerator)/denominator;",
+           "        require(share>0,'share=0');",
+           "        // Update state before transfer",
+           "        paidAmount+=share;",
+           "        // Safe transfer using low-level call",
+           "        (bool success,)=recipient.call{value:share}('');",
+           "        require(success,'transfer failed');","    }",""])
 
     if milestones:
         w(["    function addMilestone(string calldata mName,uint256 dueDate,uint256 payIdx) external onlyOwner returns(uint256 idx){",
+           "        require(bytes(mName).length>0,'empty name'); require(dueDate>0,'dueDate=0');",
            "        idx=milestones.length; milestones.push(Milestone(mName,dueDate,payIdx,MilestoneStatus.PENDING,false));","    }",
            "    function completeMilestone(uint256 idx) external whenActive onlyParty{",
-           "        milestones[idx].status=MilestoneStatus.COMPLETED; emit MilestoneCompleted(idx);","    }",
+           "        require(idx<milestones.length,'invalid id'); milestones[idx].status=MilestoneStatus.COMPLETED;",
+           "        emit MilestoneCompleted(idx);","    }",
            "    function acceptMilestone(uint256 idx) external onlyOwner whenActive{",
-           "        require(milestones[idx].status==MilestoneStatus.COMPLETED,'Not done');",
+           "        require(idx<milestones.length,'invalid id'); require(milestones[idx].status==MilestoneStatus.COMPLETED,'not done');",
            "        milestones[idx].acceptanceSigned=true; emit MilestoneAccepted(idx);","    }",""])
 
-    if has_penalties:
+    if penalties:
         w(["    function applyPenalty(address party,uint256 periods,string calldata reason) external onlyOwner{",
+           "        require(party!=address(0),'zero addr'); require(periods>0,'periods=0');",
+           "        require(penaltyRateBps>0,'rate=0'); require(totalContractValue>0,'value=0');",
            "        uint256 base=(totalContractValue*penaltyRateBps*periods)/10000;",
+           "        require(base>0,'penalty=0');",
            "        if(liabilityCap>0&&base>liabilityCap) base=liabilityCap;",
            "        accruedPenalties+=base; emit PenaltyApplied(party,base,reason);","    }",""])
 
-    if has_disputes:
+    if disputes:
         w(["    function raiseDispute(string calldata desc) external onlyParty whenActive{",
            "        disputes.push(Dispute(block.timestamp,msg.sender,desc,DisputeStatus.RAISED,''));",
            "        emit DisputeRaised(disputes.length-1,msg.sender);","    }",
@@ -292,19 +421,22 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
            "        disputes[idx].status=DisputeStatus.RESOLVED; disputes[idx].resolution=resolution;",
            "        emit DisputeResolved(idx);","    }",""])
 
-    if has_confidential:
+    if confidential:
         w(["    function recordNDA(address disclosing,address receiving,uint256 dur) external onlyOwner returns(uint256 idx){",
            "        idx=ndaRecords.length; ndaRecords.push(ConfidentialityRecord(disclosing,receiving,block.timestamp,block.timestamp+dur,false));",
            "        emit NDAdded(disclosing,receiving,block.timestamp+dur);","    }",
            "    function recordNDABreach(uint256 idx) external onlyOwner{ ndaRecords[idx].breached=true; emit NDBreached(ndaRecords[idx].receivingParty); }",
            "    function assignIP(address party) external onlyOwner{ ipAssigned[party]=true; }",""])
 
-    if has_force_maj:
+    if force_maj:
         w(["    function activateForceMajeure(string calldata reason) external onlyOwner{",
-           "        forceMajeureActive=true; emit ForceMajeureActivated(reason);","    }",
-           "    function liftForceMajeure() external onlyOwner{ forceMajeureActive=false; emit ForceMajeureLifted(block.timestamp); }",""])
+           "        require(!forceMajeureActive,'already active'); forceMajeureActive=true;",
+           "        emit ForceMajeureActivated(reason);","    }",
+           "    function liftForceMajeure() external onlyOwner{",
+           "        require(forceMajeureActive,'not active'); forceMajeureActive=false;",
+           "        emit ForceMajeureLifted(block.timestamp);","    }",""])
 
-    if has_terminations:
+    if terminations:
         w(["    function terminateContract(string calldata reason) external onlyOwner{",
            "        require(!isTerminated,'Done'); isTerminated=true; isActive=false;",
            "        emit ContractTerminated(reason,block.timestamp);","    }",
@@ -313,17 +445,34 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract") -> str:
            "        isTerminated=true; isActive=false; emit ContractTerminated('Breach',block.timestamp);","    }",""])
 
     w(["    function getStatus() external view returns(bool,bool,bool,uint256){",
-       "        return(isActive,isTerminated,forceMajeureActive,deployedAt);",'    }'])
+       "        return(isActive,isTerminated,forceMajeureActive,deployedAt);",'    }',
+       "    function getContractBalance() external view returns(uint256){",
+       "        return address(this).balance;","    }",
+       "    // Private helper — avoids external CALL opcode used by this.getSurplusBalance()",
+       "    function _calcSurplus() private view returns(uint256){",
+       "        uint256 total=0;",
+       "        for(uint256 i=0;i<paymentSchedules.length;i++){ if(paymentSchedules[i].released) total+=paymentSchedules[i].amount; }",
+       "        return address(this).balance > total ? address(this).balance-total : 0;","    }",
+       "    function getSurplusBalance() external view returns(uint256){ return _calcSurplus(); }",
+       "    function withdrawSurplus(address payable recipient) external onlyOwner{",
+       "        require(recipient!=address(0),'zero addr');",
+       "        uint256 surplus=_calcSurplus();",
+       "        require(surplus>0,'no surplus');",
+       "        (bool success,)=recipient.call{value:surplus}('');",
+       "        require(success,'transfer failed');","    }"])
     
     # Only add array length functions if the arrays are declared
-    if has_payments:
+    if payments or milestones:
         w(["    function paymentLen() external view returns(uint256){ return paymentSchedules.length; }"])
     if milestones:
         w(["    function milestoneLen() external view returns(uint256){ return milestones.length; }"])
-    if has_disputes:
+    if disputes:
         w(["    function disputeLen()   external view returns(uint256){ return disputes.length; }"])
     
-    w(["    receive() external payable {}","}"])
+    w(["    receive() external payable {",
+       "        require(isActive,'contract inactive');",
+       "        emit FundsDeposited(msg.sender,msg.value,block.timestamp);","    }",
+       "}"])
     return "\n".join(L)
 
 

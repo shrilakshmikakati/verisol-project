@@ -129,9 +129,11 @@ def extract_text_from_docx(path: str) -> str:
             pass
 
     # 4. Footnotes and endnotes (if present)
-    for part_name in ("/word/footnotes.xml", "/word/endnotes.xml"):
+    _FOOTNOTE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
+    _ENDNOTE_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes"
+    for rel_type in (_FOOTNOTE_REL, _ENDNOTE_REL):
         try:
-            part = doc.part.package.part_related_by("http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes")
+            part = doc.part.package.part_related_by(rel_type)
             if part:
                 _walk_body(etree.fromstring(part.blob))
         except Exception:
@@ -184,12 +186,16 @@ def extract_text_from_file(path: str) -> str:
         # Try multiple extraction methods and use the longest result
         methods = [extract_text_from_docx]
         try:
-            import zipfile
+            import zipfile as _zf
             # Alternative method 1: direct zipfile extraction
             def alt1(p):
-                with zipfile.ZipFile(p) as z:
+                with _zf.ZipFile(p) as z:
                     xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
-                    return re.sub(r'<[^>]+>', ' ', xml)
+                    raw = re.sub(r'<[^>]+>', ' ', xml)
+                    # Pre-clean XML artifact numbers before length comparison
+                    raw = re.sub(r'(?:\b\d{6,}\b\s*){2,}', ' ', raw)
+                    raw = re.sub(r'\s+', ' ', raw).strip()
+                    return raw
             methods.append(alt1)
         except:
             pass
@@ -273,25 +279,17 @@ def extract_pages_from_docx(path: str) -> list:
         return pages
     
     # Strategy 2: Physical page estimation with adaptive chunking
-    # Calculate total chars and estimate pages based on document structure
+    # Use character count ONLY — Word margin/header sections != logical contracts
+    # A single-contract doc with a different first-page header has 2 Word sections,
+    # so num_word_sections must never be used as a split heuristic.
     total_chars = sum(len(p.text) for p in doc.paragraphs)
-    num_word_sections = len(doc.sections) if hasattr(doc, 'sections') else 1
-    
-    # Estimate: if doc has multiple Word sections, aim to create one contract per section
-    # Word sections often correspond to page breaks or logical document divisions
-    if num_word_sections >= 3:
-        # For documents with 3+ sections, split to roughly match section count
-        # chars_per_page = total_chars / num_sections (rounded up to minimum 300)
-        chars_per_page = max(300, total_chars // num_word_sections)
-    elif num_word_sections == 2:
-        # For documents with 2 sections, create 2 pages
-        chars_per_page = max(400, total_chars // 2)
-    elif total_chars > 5000:
-        # Large docs without sections: use 2000 chars per page
+
+    if total_chars > 8000:
+        chars_per_page = 3000
+    elif total_chars > 4000:
         chars_per_page = 2000
     else:
-        # Small docs: more granular splitting (1000 chars per page)
-        chars_per_page = 1000
+        chars_per_page = 1200
     
     pages = []
     current_page = []
@@ -330,11 +328,18 @@ def extract_text_from_folder(folder: str) -> str:
 
 def preprocess_text(text: str) -> str:
     """Clean text: remove XML garbage but KEEP dates with 8 digits, fix quotes."""
-    # Remove MULTIPLE 6+ digit sequences (XML artifacts: "640490    193675", etc.)
-    # This handles: 640490    193675 (paired) or 640490    193675    ... (multiple)
-    text = re.sub(r'(?:\d{6,}\s+)+\d{6,}', '', text)
-    # Remove any remaining isolated 6-digit sequences that aren't part of dates
-    # Negative lookbehind/lookahead to avoid breaking DDMMYYYY dates
+    # Pass 1: strip Devanagari / non-ASCII noise early so digit patterns below
+    # are not disrupted by mixed Unicode sequences
+    text = re.sub(r'[\u0900-\u097F\u4e00-\u9fff]+', ' ', text)
+    # Pass 2: remove runs of 2+ whitespace-separated 6-digit sequences
+    # These are DOCX XML artifact IDs like "640490    193675"
+    # Loop until stable (multiple passes handle 3+ sequences in a row)
+    for _ in range(4):
+        prev = text
+        text = re.sub(r'(?:\b\d{6,}\b\s*){2,}', ' ', text)
+        if text == prev:
+            break
+    # Pass 3: remove any remaining isolated 6-digit sequences not part of 8-digit dates
     text = re.sub(r'(?<!\d)\d{6}(?![\d/\-])', '', text)
     # Fix smart quotes
     text = text.replace("\u2019","'").replace("\u2018","'")
@@ -375,7 +380,8 @@ ENTITY_BLOCKLIST = {
     "the","and","for","from","to","in","of","on","at","by","is","be",
     "as","an","or","if","re","a","an","it","its","this","that","these",
     # Common abbreviations that slip through
-    "pi","pg","ug","dt","mr","ms","dr","st","nd","rd","th",
+    # NOTE: "dt" intentionally removed — it appears in party names like Sangharatna_Godboley_Dt
+    "pi","pg","ug","mr","ms","dr","st","nd","rd","th",
     "etc","viz","ie","eg","nb","pp","cf","vs","op","id",
     # Indian official document noise
     "govt","estt","sno","sl","sr","no","ref","reg","sub","advt",
@@ -787,11 +793,33 @@ def build_econtract_knowledge_graph(raw_text: str) -> nx.DiGraph:
     G    = nx.DiGraph()
     G.graph["language"] = lang
 
-    all_ents = (
+    raw_ents = (
         extract_entities_atomic(text) +
         extract_entities_spacy(text)  +
         extract_clause_entities(text)
     )
+
+    # Deduplicate PAYMENT nodes by numeric value — same amount stated different ways
+    # e.g. rs10000permonth, 10000permonth, stipendofrs10000 all → one node
+    def _dedup_payments(entities):
+        seen_amounts = {}
+        result = []
+        for e in entities:
+            if e["type"] != "PAYMENT":
+                result.append(e)
+                continue
+            m = re.search(r"\d[\d,]*", e["value"])
+            if not m:
+                result.append(e)
+                continue
+            amount_key = m.group().replace(",", "")
+            if amount_key not in seen_amounts:
+                seen_amounts[amount_key] = True
+                result.append(e)
+            # else: duplicate payment amount — skip silently
+        return result
+
+    all_ents = _dedup_payments(raw_ents)
 
     for e in all_ents:
         val = e["value"].strip()
