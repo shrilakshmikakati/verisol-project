@@ -490,6 +490,7 @@ def _merge_patch(base_code: str, patch: str) -> str:
     Inject patch Solidity code into base_code just before the final closing brace.
     Handles: standalone function/struct/event/variable blocks.
     Duplicate function guard: skip patch if its first function name already exists.
+    CRITICAL: Strips out any state variable declarations to prevent injection in wrong location.
     """
     if not patch or not patch.strip():
         return base_code
@@ -505,7 +506,27 @@ def _merge_patch(base_code: str, patch: str) -> str:
     if contract_body:
         patch = contract_body.group(1).strip()
 
-    patch = patch.strip()
+    # CRITICAL: Strip out any top-level state variable declarations
+    # These would be injected in the wrong place and cause compilation errors
+    # Match patterns like: "type public varName;" at line start (with optional modifiers)
+    patch_lines = []
+    for line in patch.split('\n'):
+        stripped = line.strip()
+        # Skip lines that look like state variable declarations:
+        # - "uint256 public var;"
+        # - "mapping(...) => public var;"
+        # - "bool public var;"
+        # - etc.
+        # But keep function declarations, modifiers, and comments
+        if (re.match(r'^(uint|int|bool|address|string|bytes|mapping|enum|struct|event)\s+', stripped, re.IGNORECASE) 
+            and stripped.endswith(';') 
+            and 'function' not in stripped.lower()
+            and 'event' not in stripped.lower()):
+            # This looks like a state variable declaration, skip it
+            continue
+        patch_lines.append(line)
+    
+    patch = '\n'.join(patch_lines).strip()
     if not patch:
         return base_code
 
@@ -555,61 +576,105 @@ def _extract_patch_only(response_text: str) -> str:
 
 TYPE_GUIDANCE = {
     "DISPUTE_ARBITRATION":
-        "function raiseDispute(string calldata reason) external whenActive { ... }\n"
-        "function resolveDispute(uint256 id) external onlyOwner { ... }\n"
-        "struct Dispute { string reason; bool resolved; address raisedBy; }",
+        "// State variables already declared in base contract\n"
+        "function raiseDispute(string calldata reason) external whenActive {\n"
+        "    uint256 idx = disputes.length;\n"
+        "    disputes.push(Dispute(block.timestamp, msg.sender, reason, DisputeStatus.RAISED, ''));\n"
+        "    emit DisputeRaised(idx, msg.sender);\n}\n"
+        "function resolveDispute(uint256 idx, string calldata resolution) external onlyOwner {\n"
+        "    disputes[idx].status = DisputeStatus.RESOLVED;\n"
+        "    disputes[idx].resolution = resolution;\n"
+        "    emit DisputeResolved(idx);\n}",
     "FORCE_MAJEURE":
-        "bool public forceMajeureActive;\n"
-        "function activateForceMajeure(string calldata reason) external onlyOwner { forceMajeureActive=true; emit ForceMajeureActivated(reason); }\n"
-        "function liftForceMajeure() external onlyOwner { forceMajeureActive=false; emit ForceMajeureLifted(block.timestamp); }",
+        "// State variable forceMajeureActive already declared in base contract\n"
+        "function activateForceMajeure(string calldata reason) external onlyOwner {\n"
+        "    require(!forceMajeureActive, 'already active');\n"
+        "    forceMajeureActive = true;\n"
+        "    emit ForceMajeureActivated(reason);\n}\n"
+        "function liftForceMajeure() external onlyOwner {\n"
+        "    require(forceMajeureActive, 'not active');\n"
+        "    forceMajeureActive = false;\n"
+        "    emit ForceMajeureLifted(block.timestamp);\n}",
     "CONFIDENTIALITY_IP":
-        "struct ConfidentialityRecord { address discloser; address recipient; uint256 expiry; bool breached; }\n"
-        "mapping(uint256=>ConfidentialityRecord) public ndaRecords; uint256 public ndaCount;\n"
-        "function recordNDA(address discloser, address recipient, uint256 expiry) external onlyOwner { ... }\n"
-        "function recordNDABreach(uint256 id) external onlyOwner { ... }",
+        "// ConfidentialityRecord struct and ndaRecords mapping already declared\n"
+        "function recordNDA(address disclosing, address receiving, uint256 dur) external onlyOwner returns(uint256 idx) {\n"
+        "    idx = ndaRecords.length;\n"
+        "    ndaRecords.push(ConfidentialityRecord(disclosing, receiving, block.timestamp, block.timestamp + dur, false));\n"
+        "    emit NDAdded(disclosing, receiving, block.timestamp + dur);\n}\n"
+        "function recordNDABreach(uint256 idx) external onlyOwner {\n"
+        "    ndaRecords[idx].breached = true;\n"
+        "    emit NDBreached(ndaRecords[idx].receivingParty);\n}\n"
+        "function assignIP(address party) external onlyOwner {\n"
+        "    ipAssigned[party] = true;\n}",
     "MILESTONE":
-        "struct Milestone { string description; bool completed; bool accepted; }\n"
-        "mapping(uint256=>Milestone) public milestones; uint256 public milestoneCount;\n"
-        "function addMilestone(string calldata desc) external onlyOwner returns(uint256 id) { ... }\n"
-        "function completeMilestone(uint256 id) external whenActive { ... }\n"
-        "function acceptMilestone(uint256 id) external onlyOwner { ... }",
+        "// Milestone struct and milestones array already declared\n"
+        "function addMilestone(string calldata name, uint256 dueDate, uint256 paymentIdx) external onlyOwner returns(uint256 idx) {\n"
+        "    idx = milestones.length;\n"
+        "    milestones.push(Milestone(name, dueDate, paymentIdx, MilestoneStatus.PENDING, false));\n}\n"
+        "function completeMilestone(uint256 idx) external onlyOwner whenActive {\n"
+        "    milestones[idx].status = MilestoneStatus.COMPLETED;\n"
+        "    emit MilestoneCompleted(idx);\n}\n"
+        "function acceptMilestone(uint256 idx) external onlyOwner {\n"
+        "    milestones[idx].acceptanceSigned = true;\n"
+        "    emit MilestoneAccepted(idx);\n}",
     "PAYMENT":
-        "uint256 public stipendAmount;\n"
-        "function releaseStipend(address payable recipient) external onlyOwner whenActive {\n"
-        "    require(address(this).balance >= stipendAmount, 'Insufficient balance');\n"
-        "    recipient.transfer(stipendAmount);\n"
-        "    emit PaymentReleased(0, recipient, stipendAmount);\n}",
+        "// paymentSchedules array already declared in base contract\n"
+        "function releasePayment(uint256 idx, address payable recipient) external onlyOwner whenActive {\n"
+        "    require(recipient != address(0), 'zero addr');\n"
+        "    require(idx < paymentSchedules.length, 'invalid index');\n"
+        "    require(!paymentSchedules[idx].released, 'already released');\n"
+        "    paymentSchedules[idx].released = true;\n"
+        "    paidAmount += paymentSchedules[idx].amount;\n"
+        "    (bool success, ) = recipient.call{value: paymentSchedules[idx].amount}('');\n"
+        "    require(success, 'transfer failed');\n"
+        "    emit PaymentReleased(idx, recipient, paymentSchedules[idx].amount);\n}",
     "PENALTY_REMEDY":
-        "uint256 public penaltyRateBps; uint256 public accruedPenalties; uint256 public liabilityCap;\n"
-        "function applyPenalty(address party, uint256 amount, string calldata reason) external onlyOwner {\n"
-        "    uint256 pen = (amount * penaltyRateBps) / 10000;\n"
-        "    if(liabilityCap > 0) pen = pen > liabilityCap ? liabilityCap : pen;\n"
-        "    accruedPenalties += pen;\n"
-        "    emit PenaltyApplied(party, pen, reason);\n}",
+        "// penaltyRateBps, accruedPenalties, liabilityCap already declared in base contract\n"
+        "function applyPenalty(address party, uint256 periods, string calldata reason) external onlyOwner {\n"
+        "    require(penaltyRateBps > 0, 'rate=0');\n"
+        "    require(totalContractValue > 0, 'value=0');\n"
+        "    uint256 base = (totalContractValue * penaltyRateBps * periods) / 10000;\n"
+        "    if(liabilityCap > 0 && base > liabilityCap) base = liabilityCap;\n"
+        "    accruedPenalties += base;\n"
+        "    emit PenaltyApplied(party, base, reason);\n}",
     "CONDITION":
-        "struct ConditionRecord { string description; bool isFulfilled; bool isCarveOut; }\n"
-        "mapping(uint256=>ConditionRecord) public conditionRecords; uint256 public conditionCount;\n"
-        "function addCondition(string calldata desc, bool carveOut) external onlyOwner returns(uint256 id) { ... }\n"
-        "function fulfillCondition(uint256 id) external whenActive { conditionRecords[id].isFulfilled=true; emit ConditionFulfilled(id); }",
+        "// ConditionRecord struct already declared in base contract\n"
+        "function addCondition(string calldata desc, bool carveOut, bool nested, uint256 parentId) external onlyOwner returns(uint256 id) {\n"
+        "    id = conditionCount++;\n"
+        "    conditionRecords[id] = ConditionRecord(desc, false, carveOut, nested, parentId);\n}\n"
+        "function fulfillCondition(uint256 id) external whenActive {\n"
+        "    conditionRecords[id].isFulfilled = true;\n"
+        "    emit ConditionFulfilled(id);\n}",
     "TERMINATION":
+        "// isTerminated already declared in base contract\n"
         "function terminateContract(string calldata reason) external onlyOwner whenActive {\n"
-        "    isTerminated=true; emit ContractTerminated(reason, block.timestamp);\n}\n"
-        "function terminateForBreach(string calldata reason) external onlyOwner {\n"
-        "    isTerminated=true; emit ContractTerminated(reason, block.timestamp);\n}",
+        "    isTerminated = true;\n"
+        "    isActive = false;\n"
+        "    emit ContractTerminated(reason, block.timestamp);\n}\n"
+        "function terminateForBreach(uint256 id) external onlyOwner {\n"
+        "    require(obligationRecords[id].status == ObligationStatus.BREACHED, 'Not breached');\n"
+        "    isTerminated = true;\n"
+        "    isActive = false;\n"
+        "    emit ContractTerminated('Breach', block.timestamp);\n}",
     "OBLIGATION":
-        "enum ObligationStatus { PENDING, FULFILLED, BREACHED, WAIVED }\n"
-        "struct ObligationRecord { string description; ObligationStatus status; address assignedTo; uint256 deadline; bool bestEfforts; }\n"
-        "mapping(uint256=>ObligationRecord) public obligationRecords; uint256 public obligationCount;\n"
-        "function addObligation(string calldata desc, address to, uint256 deadline, bool bestEfforts) external onlyOwner returns(uint256 id) { ... }\n"
-        "function fulfillObligation(uint256 id) external whenActive { obligationRecords[id].status=ObligationStatus.FULFILLED; emit ObligationFulfilled(id, msg.sender); }",
+        "// ObligationStatus enum and ObligationRecord struct already declared\n"
+        "function addObligation(string calldata desc, address to, uint256 deadline, bool bestEfforts) external onlyOwner returns(uint256 id) {\n"
+        "    id = obligationCount++;\n"
+        "    obligationRecords[id] = ObligationRecord(desc, ObligationStatus.PENDING, to, deadline, bestEfforts);\n"
+        "    emit ObligationAdded(id, desc, bestEfforts);\n}\n"
+        "function fulfillObligation(uint256 id) external whenActive onlyParty {\n"
+        "    require(obligationRecords[id].status == ObligationStatus.PENDING, 'Not pending');\n"
+        "    obligationRecords[id].status = ObligationStatus.FULFILLED;\n"
+        "    emit ObligationFulfilled(id, msg.sender);\n}\n"
+        "function markObligationBreached(uint256 id) external onlyOwner {\n"
+        "    obligationRecords[id].status = ObligationStatus.BREACHED;\n"
+        "    emit ObligationBreached(id);\n}",
     "PARTY":
-        "// Add address state variable for each party:\n"
-        "address public internAddress;\n"
-        "address public supervisorAddress;\n"
-        "// Update onlyParty() modifier to include these addresses",
+        "// Party addresses are already declared in base contract state variables\n"
+        "// Ensure onlyParty() modifier includes all party addresses",
     "DATE_DEADLINE":
-        "uint256 public reportingDeadline; // set in constructor as Unix timestamp\n"
-        "// In fulfillObligation: require(block.timestamp <= reportingDeadline, 'Deadline passed');",
+        "// Deadline dates are encoded as constants or checked against contractEndDate\n"
+        "// Use block.timestamp comparisons in functions that need deadline enforcement",
 }
 
 def _build_patch_prompt(
@@ -754,7 +819,16 @@ All unmatched labels have been resolved: {len(unmatched) == 0}
 2. Do NOT repeat any existing function or struct.
 3. NO pragma, import, or contract wrapper.
 4. NO markdown. Only valid Solidity 0.8.16.
-5. Focus on quality: even 1-2 well-crafted functions that fix {bottleneck} is better than generic code."""
+5. NEVER declare new state variables, structs, enums, or mappings:
+   - ALL state variables are already declared in the base contract
+   - Output ONLY function implementations and modifier additions
+   - If you need to reference a state variable, it's already declared (use it as-is)
+   - Do NOT include variable declarations like 'uint256 public myVar;'
+6. CRITICAL: Make sure ANY code you output:
+   - Uses ONLY variables/mappings/enums that already exist in the base contract
+   - Properly declares loop variables in for loop headers: for(uint256 i=0; i<length; i++)
+   - Uses correct spacing around = assignments: variable = value; (not variable=value;)
+7. Focus on quality: even 1-2 well-crafted functions that fix {bottleneck} is better than generic code."""
 
 
 
