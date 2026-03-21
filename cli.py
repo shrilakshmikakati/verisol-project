@@ -535,7 +535,7 @@ def cmd_demo(args):
     import tempfile
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
     tmp.write(DEMO_CONTRACT); tmp.flush(); tmp.close()
-    out = getattr(args, "output", None) or "./contractforge_output/demo"
+    out = getattr(args, "output", None) or "./Results/demo"
     run_pipeline(tmp.name, "ServiceAgreement", out)
     os.unlink(tmp.name)
 
@@ -554,12 +554,12 @@ def cmd_run_multi(args):
     from core.econtract_kg import extract_pages_from_docx
     
     if path.suffix.lower() != ".docx":
-        print(red(f"  ✗  run-multi only supports .docx files (got {path.suffix})"))
+        print(red(f"   run-multi only supports .docx files (got {path.suffix})"))
         sys.exit(1)
     
     pages = extract_pages_from_docx(str(path))
     if not pages:
-        print(yellow(f"  ⚠  Document doesn't have multiple pages/sections, using single-page mode"))
+        print(yellow(f"   Document doesn't have multiple pages/sections, using single-page mode"))
         print(f"     (Use 'python cli.py run' instead)\n")
         return
     
@@ -605,7 +605,7 @@ def cmd_run(args):
         print(red(f"  ✗  File not found: {args.file}"))
         sys.exit(1)
     name = args.name or path.stem.replace(" ", "_") or "Contract"
-    out  = args.output or f"./contractforge_output/{name}"
+    out  = args.output or f"./Results/{name}"
     print(f"  {bold('Input')}   {cyan(str(path.resolve()))}")
     print(f"  {bold('Name')}    {cyan(name)}")
     print(f"  {bold('Output')}  {cyan(str(Path(out).resolve()))}\n")
@@ -633,15 +633,15 @@ def main():
     p_run = sub.add_parser("run", help="Process a single-page e-contract file")
     p_run.add_argument("--file",   required=True, help="Path to .txt/.docx/.png/.jpg or folder")
     p_run.add_argument("--name",   default="",    help="Contract name (default: filename stem)")
-    p_run.add_argument("--output", default="",    help="Output directory (default: ./contractforge_output/<name>)")
+    p_run.add_argument("--output", default="",    help="Output directory (default: ./Results/<name>)")
 
     p_multi = sub.add_parser("run-multi", help="Process multi-page DOCX (separate contract per page)")
     p_multi.add_argument("--file",   required=True, help="Path to .docx file with multiple pages/sections")
     p_multi.add_argument("--name",   default="",    help="Base contract name for all pages")
-    p_multi.add_argument("--output", default="",    help="Output directory (default: ./contractforge_output/<name>_multi)")
+    p_multi.add_argument("--output", default="",    help="Output directory (default: ./Results/<name>_multi)")
 
     p_demo = sub.add_parser("demo", help="Run with built-in sample contract")
-    p_demo.add_argument("--output", default="./contractforge_output/demo", help="Output directory")
+    p_demo.add_argument("--output", default="./Results/demo", help="Output directory")
 
     sub.add_parser("check", help="Check all dependencies are installed")
 
