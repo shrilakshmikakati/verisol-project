@@ -471,11 +471,7 @@ def _make_zip(zip_path: Path, out_dir: Path, name: str, orig_file: str,
         zf.writestr(f"{name}.sol", solidity.encode())
         zf.writestr("results.json", json.dumps(results, indent=2).encode())
         zf.writestr("README.txt", readme.encode())
-        for img in ["econtract_kg.png", "smartcontract_kg_initial.png", "smartcontract_kg_final.png"]:
-            p = out_dir / img
-            if p.exists():
-                zf.write(p, img)
-
+        
 
 def _print_final_summary(cmp, iterations, out, sol_path):
     acc   = cmp["accuracy"]
@@ -580,7 +576,7 @@ def cmd_run_multi(args):
         page_out  = f"{base_out}/{page_name}"
         
         print(f"\n{cyan('─'*60)}")
-        print(f"  📄  Page {page_num}/{len(pages)}  {dim(title[:40])}")
+        print(f"    Page {page_num}/{len(pages)}  {dim(title[:40])}")
         print(f"{cyan('─'*60)}\n")
         
         # Create temp file for this page
