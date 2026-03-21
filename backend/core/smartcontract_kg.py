@@ -164,37 +164,40 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
         w([f"    address public {pid};"])
     w([""])
 
+    # ─ CORE contract parameters (always declared) ─
+    w(["    uint256 public totalContractValue; uint256 public paidAmount;",
+       "    uint256 public penaltyRateBps; uint256 public penaltyPeriod; uint256 public liabilityCap; uint256 public accruedPenalties;",
+       ""])
+
     if payments or milestones:
         w(["    struct PaymentSchedule { uint256 amount; uint256 dueDate; bool released; string description; }",
-           "    PaymentSchedule[] public paymentSchedules;",
-           "    uint256 public totalContractValue; uint256 public paidAmount;",""])
+           "    PaymentSchedule[] public paymentSchedules;",""])
     
     # Add utility billing structures if utilities are referenced
     if utilities and any(utilities.values()):
         w(["    struct UtilityBilling { string utilityName; string meterId; uint256 lastReading; uint256 currentReading; uint256 amountDue; uint256 dueDate; bool paid; }",
            "    UtilityBilling[] public utilityBillings;",""])
     
-    # TenantObligation is RENTAL-SPECIFIC — only emit when sublet/structural/residential
-    # keywords were actually extracted from the e-contract. General obligations (internship,
-    # NDA, service agreements) must NOT get rental boilerplate fields.
-    if tenant_obligations:
-        w(["    enum TenantObligationStatus { PENDING, ACKNOWLEDGED, COMPLIANT, BREACHED }",
-           "    struct TenantObligation { string description; TenantObligationStatus status; uint256 deadline; bool isSubletProhibition; bool isStructuralProhibition; bool isResidentialUseOnly; }",
-           "    mapping(uint256 => TenantObligation) public tenantObligations; uint256 public tenantObligationCount;",""])
+    # ─ TENANT OBLIGATION TRACKING (declare unconditionally for consistency) ─
+    w(["    enum TenantObligationStatus { PENDING, ACKNOWLEDGED, COMPLIANT, BREACHED }",
+       "    struct TenantObligation { string description; TenantObligationStatus status; uint256 deadline; bool isSubletProhibition; bool isStructuralProhibition; bool isResidentialUseOnly; }",
+       "    mapping(uint256 => TenantObligation) public tenantObligations; uint256 public tenantObligationCount;",
+       ""])
     
     if milestones:
         w(["    enum MilestoneStatus { PENDING, IN_PROGRESS, COMPLETED, DISPUTED }",
            "    struct Milestone { string name; uint256 dueDate; uint256 paymentIndex; MilestoneStatus status; bool acceptanceSigned; }",
            "    Milestone[] public milestones;",""])
-    if obligations:
-        w(["    enum ObligationStatus { PENDING, FULFILLED, BREACHED, WAIVED }",
-           "    struct ObligationRecord { string description; ObligationStatus status; address assignedTo; uint256 deadline; bool bestEfforts; }",
-           "    mapping(uint256 => ObligationRecord) public obligationRecords; uint256 public obligationCount;",""])
+    
+    # ─ OBLIGATION TRACKING (always declared for consistency) ─
+    w(["    enum ObligationStatus { PENDING, FULFILLED, BREACHED, WAIVED }",
+       "    struct ObligationRecord { string description; ObligationStatus status; address assignedTo; uint256 deadline; bool bestEfforts; }",
+       "    mapping(uint256 => ObligationRecord) public obligationRecords; uint256 public obligationCount;",
+       ""])
+    
     if conditions:
         w(["    struct ConditionRecord { string description; bool isFulfilled; bool isCarveOut; bool isNested; uint256 parentCondId; }",
            "    mapping(uint256 => ConditionRecord) public conditionRecords; uint256 public conditionCount;",""])
-    if penalties:
-        w(["    uint256 public penaltyRateBps; uint256 public penaltyPeriod; uint256 public liabilityCap; uint256 public accruedPenalties;",""])
     if disputes:
         w([f'    string public constant GOVERNING_LAW = "{governing_law}";',
            f'    string public constant JURISDICTION = "{jurisdiction}";',
@@ -272,43 +275,42 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
     if value_declarations:
         w(value_declarations + [""])
 
-    # Build constructor with party initialization
-    if penalties or payments or milestones or obligations or tenant_obligations:
-        # Create party address parameters for constructor
-        party_params = ", ".join([f"address _{_safe_id(p['id'])}" for p in parties[:6] if _safe_id(p["id"])])
-        if party_params:
-            party_params = ", " + party_params
-        
-        w(["    constructor(",
-           f"        uint256 _totalValue,",
-           f"        uint256 _penaltyBps,",
-           f"        uint256 _penaltyPeriod,",
-           f"        uint256 _liabilityCap{party_params},",
-           f"        string memory _currency,",
-           f"        uint256 _startDate,",
-           f"        uint256 _endDate",
-           "    ) {"])
-        
-        w(["        owner=msg.sender; isActive=true; deployedAt=block.timestamp;",
-           "        totalContractValue=_totalValue; penaltyRateBps=_penaltyBps;",
-           "        penaltyPeriod=_penaltyPeriod; liabilityCap=_liabilityCap;",
-           "        require(_totalValue>0,'totalValue=0');",
-           "        // penaltyBps=0 is valid for non-penalty contracts (internship, NDA, etc.)",
-           "        currency=_currency; contractStartDate=_startDate; contractEndDate=_endDate;",
-           "        require(_endDate>_startDate,'end<=start');",
-           f'        jurisdiction="{jurisdiction}";'])
-        
-        # Assign party addresses from constructor parameters
-        for i, p in enumerate(parties[:6]):
-            pid = _safe_id(p['id'])
-            w([f"        {pid}=_{pid};"])
-        
-        # Add payment schedule initialization
-        if init_payments:
-            w(["        // Initialize payment schedules from e-contract:"])
-            w(["        " + line for line in init_payments])
-        
-        w(["        emit ContractActivated(msg.sender,block.timestamp);",'    }',''])
+    # Build constructor (always generate for proper initialization)
+    # Create party address parameters for constructor
+    party_params = ", ".join([f"address _{_safe_id(p['id'])}" for p in parties[:6] if _safe_id(p["id"])])
+    if party_params:
+        party_params = ", " + party_params
+    
+    w(["    constructor(",
+       f"        uint256 _totalValue,",
+       f"        uint256 _penaltyBps,",
+       f"        uint256 _penaltyPeriod,",
+       f"        uint256 _liabilityCap{party_params},",
+       f"        string memory _currency,",
+       f"        uint256 _startDate,",
+       f"        uint256 _endDate",
+       "    ) {"])
+    
+    w(["        owner=msg.sender; isActive=true; deployedAt=block.timestamp;",
+       "        totalContractValue=_totalValue; penaltyRateBps=_penaltyBps;",
+       "        penaltyPeriod=_penaltyPeriod; liabilityCap=_liabilityCap;",
+       "        require(_totalValue>0,'totalValue=0');",
+       "        // penaltyBps=0 is valid for non-penalty contracts (internship, NDA, etc.)",
+       "        currency=_currency; contractStartDate=_startDate; contractEndDate=_endDate;",
+       "        require(_endDate>_startDate,'end<=start');",
+       f'        jurisdiction="{jurisdiction}";'])
+    
+    # Assign party addresses from constructor parameters
+    for i, p in enumerate(parties[:6]):
+        pid = _safe_id(p['id'])
+        w([f"        {pid}=_{pid};"])
+    
+    # Add payment schedule initialization
+    if init_payments:
+        w(["        // Initialize payment schedules from e-contract:"])
+        w(["        " + line for line in init_payments])
+    
+    w(["        emit ContractActivated(msg.sender,block.timestamp);",'    }',''])
     
     # Helper function for contract term validation
     w(["    function isContractTermExpired() external view returns(bool){",
