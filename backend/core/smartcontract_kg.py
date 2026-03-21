@@ -169,16 +169,22 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "    uint256 public penaltyRateBps; uint256 public penaltyPeriod; uint256 public liabilityCap; uint256 public accruedPenalties;",
        ""])
 
-    if payments or milestones:
-        w(["    struct PaymentSchedule { uint256 amount; uint256 dueDate; bool released; string description; }",
-           "    PaymentSchedule[] public paymentSchedules;",""])
+    # ─ PAYMENT SCHEDULES (ALWAYS DECLARED - required by _calcSurplus() which is always generated) ─
+    w(["    struct PaymentSchedule { uint256 amount; uint256 dueDate; bool released; string description; }",
+       "    PaymentSchedule[] public paymentSchedules;",""])
     
     # Add utility billing structures if utilities are referenced
     if utilities and any(utilities.values()):
         w(["    struct UtilityBilling { string utilityName; string meterId; uint256 lastReading; uint256 currentReading; uint256 amountDue; uint256 dueDate; bool paid; }",
            "    UtilityBilling[] public utilityBillings;",""])
     
-    # ─ TENANT OBLIGATION TRACKING (declare unconditionally for consistency) ─
+    # ─ OBLIGATION TRACKING (always declared for consistency) ─
+    w(["    enum ObligationStatus { PENDING, FULFILLED, BREACHED, WAIVED }",
+       "    struct ObligationRecord { string description; ObligationStatus status; address assignedTo; uint256 deadline; bool bestEfforts; }",
+       "    mapping(uint256 => ObligationRecord) public obligationRecords; uint256 public obligationCount;",
+       ""])
+    
+    # ─ TENANT OBLIGATION TRACKING (always declared for consistency) ─
     w(["    enum TenantObligationStatus { PENDING, ACKNOWLEDGED, COMPLIANT, BREACHED }",
        "    struct TenantObligation { string description; TenantObligationStatus status; uint256 deadline; bool isSubletProhibition; bool isStructuralProhibition; bool isResidentialUseOnly; }",
        "    mapping(uint256 => TenantObligation) public tenantObligations; uint256 public tenantObligationCount;",
@@ -188,12 +194,6 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
         w(["    enum MilestoneStatus { PENDING, IN_PROGRESS, COMPLETED, DISPUTED }",
            "    struct Milestone { string name; uint256 dueDate; uint256 paymentIndex; MilestoneStatus status; bool acceptanceSigned; }",
            "    Milestone[] public milestones;",""])
-    
-    # ─ OBLIGATION TRACKING (always declared for consistency) ─
-    w(["    enum ObligationStatus { PENDING, FULFILLED, BREACHED, WAIVED }",
-       "    struct ObligationRecord { string description; ObligationStatus status; address assignedTo; uint256 deadline; bool bestEfforts; }",
-       "    mapping(uint256 => ObligationRecord) public obligationRecords; uint256 public obligationCount;",
-       ""])
     
     if conditions:
         w(["    struct ConditionRecord { string description; bool isFulfilled; bool isCarveOut; bool isNested; uint256 parentCondId; }",
