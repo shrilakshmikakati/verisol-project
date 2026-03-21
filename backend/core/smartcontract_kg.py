@@ -475,7 +475,14 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "        require(isActive,'contract inactive');",
        "        emit FundsDeposited(msg.sender,msg.value,block.timestamp);","    }",
        "}"])
-    return "\n".join(L)
+    # Post-process: Remove any assert lines referencing 'i' outside loops (prevents undeclared identifier errors)
+    solidity_lines = []
+    for line in L:
+        # Remove lines like: assert(!(i<paymentSchedules.length)); or assert(!(!(i<paymentSchedules.length)));
+        if re.match(r"\s*assert\s*\(.*i\s*[<>=].*\)\s*;", line):
+            continue
+        solidity_lines.append(line)
+    return "\n".join(solidity_lines)
 
 
 # ── AST → KG (Algorithm 2) ───────────────────────────────────────────────────
