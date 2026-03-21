@@ -1,0 +1,68 @@
+{
+  "contract_name": "etidhanush",
+  "source_file": "etidhanush.docx",
+  "generated_at": "2026-03-21T11:30:25.902757Z",
+  "solidity_version": "0.8.16",
+  "pipeline": {
+    "iterations_used": 0,
+    "llm_model": "qwen2.5:7b"
+  },
+  "initial_comparison": {
+    "accuracy": 97.22,
+    "base_accuracy": 97.22,
+    "completeness": 100.0,
+    "completeness_status": "\u2713 VALIDATED (100%)",
+    "node_similarity": 94.44,
+    "edge_similarity": 100.0,
+    "type_coverage_pct": 100.0,
+    "ec_nodes": 18,
+    "sc_nodes": 128
+  },
+  "final_comparison": {
+    "accuracy": 97.22,
+    "base_accuracy": 97.22,
+    "completeness": 100.0,
+    "completeness_status": "\u2713 VALIDATED (100%)",
+    "node_similarity": 94.44,
+    "edge_similarity": 100.0,
+    "type_coverage_pct": 100.0,
+    "ec_nodes": 18,
+    "sc_nodes": 128,
+    "ec_edges": 2,
+    "sc_edges": 82,
+    "matched_nodes": [
+      "professor",
+      "candidate",
+      "intern",
+      "sangharatnagodboleydt",
+      "etidhanush",
+      "sangharatnagodboley",
+      "rs10000permonth",
+      "india",
+      "telangana",
+      "sangharatnagodboleydt08072025",
+      "internshipdearcandidate",
+      "willreceive",
+      "terminable",
+      "appointmentispurelytemporary",
+      "failingwhich",
+      "cancelled"
+    ],
+    "unmatched_nodes": [
+      "date20250708",
+      "date20250808"
+    ],
+    "is_validated": true
+  },
+  "refinement_history": [
+    {
+      "iteration": 0,
+      "accuracy": 97.22,
+      "node_similarity": 94.44,
+      "edge_similarity": 100.0,
+      "type_coverage": 100.0,
+      "sc_nodes": 128,
+      "is_valid": true
+    }
+  ]
+}

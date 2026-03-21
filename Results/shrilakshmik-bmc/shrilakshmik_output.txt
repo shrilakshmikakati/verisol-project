@@ -1,0 +1,1 @@
+./convert.sh: line 72: solc: command not found

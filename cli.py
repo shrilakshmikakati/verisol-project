@@ -564,7 +564,7 @@ def cmd_run_multi(args):
         return
     
     base_name = args.name or path.stem.replace(" ", "_") or "Contract"
-    base_out  = args.output or f"./contractforge_output/{base_name}_multi"
+    base_out  = args.output or f"./Result/{base_name}_multi"
     
     print(f"  {bold('Input')}   {cyan(str(path.resolve()))}")
     print(f"  {bold('Pages')}   {cyan(str(len(pages)))}")
