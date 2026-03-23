@@ -115,38 +115,66 @@ def _to_uint(v: str) -> str:
         return p[0] + p[1].ljust(18, "0")[:18]
     return r
 
-def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: dict = None) -> str:
+def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: dict = None,
+                   page_number: int = 0, page_title: str = "") -> str:
     """
     Generate Solidity contract from knowledge graph.
-    
+
     Args:
-        kg: Knowledge graph dictionary with nodes and edges
-        contract_name: Name of the contract
-        party_addresses: Dict mapping party IDs to Ethereum addresses (optional)
-        
-    Returns:
-        Generated Solidity code as string
+        kg:              Knowledge graph dict with nodes/edges
+        contract_name:   Solidity contract name
+        party_addresses: Optional mapping of party IDs to Ethereum addresses
+        page_number:     Page number in multi-page mode (0 = single-page)
+        page_title:      Section/page title embedded as PAGE_CONTEXT constant
     """
     nodes = kg.get("nodes", [])
     name  = re.sub(r"[^A-Za-z0-9]", "", contract_name) or "EContract"
     def by(*t): return [n for n in nodes if n.get("entity_type") in t]
 
-    parties=by("PARTY","ORG","PERSON"); obligations=by("OBLIGATION")
-    payments=by("PAYMENT","MONEY"); milestones=by("MILESTONE")
-    conditions=by("CONDITION"); terminations=by("TERMINATION")
-    penalties=by("PENALTY_REMEDY","PENALTY"); disputes=by("DISPUTE_ARBITRATION")
-    confidential=by("CONFIDENTIALITY_IP"); force_maj=by("FORCE_MAJEURE")
-    
-    # Dynamically extract critical contract metadata
-    governing_law = _extract_governing_law(nodes)
-    jurisdiction = _extract_jurisdiction(nodes)
+    parties      = by("PARTY","ORG","PERSON");   obligations  = by("OBLIGATION")
+    payments     = by("PAYMENT","MONEY");         milestones   = by("MILESTONE")
+    conditions   = by("CONDITION");               terminations = by("TERMINATION")
+    penalties    = by("PENALTY_REMEDY","PENALTY"); disputes    = by("DISPUTE_ARBITRATION")
+    confidential = by("CONFIDENTIALITY_IP");      force_maj    = by("FORCE_MAJEURE")
+    date_nodes   = by("DATE_DEADLINE")
+
+    governing_law    = _extract_governing_law(nodes)
+    jurisdiction     = _extract_jurisdiction(nodes)
     arbitration_body = _extract_arbitration_body(nodes)
-    contract_start_date, contract_end_date = _extract_contract_dates(nodes)
-    utilities = _extract_utility_references(nodes)
+    utilities        = _extract_utility_references(nodes)
     tenant_obligations = _extract_tenant_obligations(nodes)
-    
+
     if party_addresses is None:
         party_addresses = {}
+
+    # ── Detect joining/reporting deadline (e.g. "report by 08/08/2025 or cancelled") ──
+    reporting_deadline_ts: str = "0"
+    for dn in date_nodes:
+        label = dn.get("label", "").replace("-", "")
+        d8 = re.search(r"(\d{2})(\d{2})(\d{4})", label)
+        if d8:
+            ts = _ddmmyyyy_to_timestamp(d8.group(1) + d8.group(2) + d8.group(3))
+            if ts != "0":
+                reporting_deadline_ts = ts
+                break
+    has_deadline = reporting_deadline_ts != "0" and (terminations or obligations)
+
+    # ── Unified, deduplicated, noise-cleaned party list ──────────────────────
+    # Single source of truth: used in state vars, modifier, constructor params, body.
+    _NOISE_SUFFIX_RE = re.compile(r"(_[Dd]t|_[Dd]ate|_[Nn]o|_[Rr]ef)$")
+    party_pairs: list = []
+    _seen_norm: set = set()
+    _seen_pid:  set = set()
+    for i, p in enumerate(parties[:10]):
+        raw_pid   = _safe_id(p["id"])
+        clean_pid = _NOISE_SUFFIX_RE.sub("", raw_pid)
+        norm      = re.sub(r"[^a-z0-9]", "", clean_pid.lower())
+        if not norm or norm in _seen_norm:
+            continue
+        _seen_norm.add(norm)
+        pid = f"{clean_pid}_{i}" if clean_pid in _seen_pid else clean_pid
+        _seen_pid.add(pid)
+        party_pairs.append((pid, p))
 
     L=[]; w=L.extend
     w(["// SPDX-License-Identifier: MIT","pragma solidity ^0.8.16;","",
@@ -158,9 +186,12 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "    uint256 public contractStartDate; uint256 public contractEndDate;",
        "    string public currency; string public jurisdiction;",""])
 
-    seen_p: set = set()
-    for i,p in enumerate(parties[:6]):
-        pid=_safe_id(p["id"]); pid = f"{pid}_{i}" if pid in seen_p else pid; seen_p.add(pid)
+    if page_number > 0:
+        safe_title = (page_title or "").replace('"', "").replace("'", "")[:60]
+        w([f'    uint256 public constant PAGE_NUMBER = {page_number};',
+           f'    string  public constant PAGE_CONTEXT = "{safe_title}";', ""])
+
+    for pid, _ in party_pairs:
         w([f"    address public {pid};"])
     w([""])
 
@@ -184,11 +215,12 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "    mapping(uint256 => ObligationRecord) public obligationRecords; uint256 public obligationCount;",
        ""])
     
-    # ─ TENANT OBLIGATION TRACKING (always declared for consistency) ─
-    w(["    enum TenantObligationStatus { PENDING, ACKNOWLEDGED, COMPLIANT, BREACHED }",
-       "    struct TenantObligation { string description; TenantObligationStatus status; uint256 deadline; bool isSubletProhibition; bool isStructuralProhibition; bool isResidentialUseOnly; }",
-       "    mapping(uint256 => TenantObligation) public tenantObligations; uint256 public tenantObligationCount;",
-       ""])
+    # ─ TENANT OBLIGATION TRACKING (only for lease/rental/tenant contracts) ─
+    if tenant_obligations:
+        w(["    enum TenantObligationStatus { PENDING, ACKNOWLEDGED, COMPLIANT, BREACHED }",
+           "    struct TenantObligation { string description; TenantObligationStatus status; uint256 deadline; bool isSubletProhibition; bool isStructuralProhibition; bool isResidentialUseOnly; }",
+           "    mapping(uint256 => TenantObligation) public tenantObligations; uint256 public tenantObligationCount;",
+           ""])
     
     if milestones:
         w(["    enum MilestoneStatus { PENDING, IN_PROGRESS, COMPLETED, DISPUTED }",
@@ -224,8 +256,8 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "    event NDAdded(address indexed d, address indexed r, uint256 exp); event NDBreached(address indexed p);",
        "    event ContractTerminated(string reason, uint256 at);",""])
 
-    # Modifiers
-    cond=" || ".join(f"msg.sender=={_safe_id(p['id'])}" for p in parties[:6] if _safe_id(p["id"])) or "msg.sender==owner"
+    # Modifiers — use party_pairs (same cleaned, deduped IDs as state vars)
+    cond = " || ".join(f"msg.sender=={pid}" for pid, _ in party_pairs) or "msg.sender==owner"
     w(["    modifier onlyOwner() { require(msg.sender==owner,'Not owner'); _; }",
        "    modifier whenActive() { require(isActive&&!isTerminated,'Not active'); require(!forceMajeureActive,'Force majeure'); _; }",
        f"    modifier onlyParty() {{ require({cond}||msg.sender==owner,'Not a party'); _; }}",""])
@@ -251,21 +283,44 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
         if len(init_payments) >= 6:
             break
 
-    # ── Value constants (placed BEFORE constructor per Solidity convention) ──
+    # ── Value constants — only genuine monetary amounts and real dates ────────
+    # Rules: skip year numbers (1900-2100), skip 8-digit dates already in DATE_
+    # only emit VALUE_ for PAYMENT-typed nodes or labels with currency keywords.
     value_declarations = []
-    all_amounts = {}
-    all_dates   = {}
+    all_amounts: dict = {}
+    all_dates:   dict = {}
+    payment_node_ids = {n["id"] for n in nodes if n.get("entity_type") == "PAYMENT"}
     for node in nodes:
         label_str = str(node.get("label", ""))
         if not label_str:
             continue
-        for amt in re.findall(r"\d{1,3}(?:,\d{3})+|\d{4,}", label_str):
-            normalized = amt.replace(",", "")
-            all_amounts[normalized] = all_amounts.get(normalized, 0) + 1
-        for dt in re.findall(r"\d{8}", label_str):
-            ts = _ddmmyyyy_to_timestamp(dt)
+        node_id    = node.get("id", "")
+        is_payment = node_id in payment_node_ids
+        has_currency = bool(re.search(
+            r"(?:rs\.?|inr|usd|\$|€|£|stipend|salary|amount|payment|fee|fine|penalty)",
+            label_str, re.I))
+        # Dates: always collect DDMMYYYY
+        for d8 in re.findall(r"\d{8}", label_str):
+            ts = _ddmmyyyy_to_timestamp(d8)
             if ts != "0":
-                all_dates[f"DATE_{dt}"] = ts
+                all_dates[f"DATE_{d8}"] = ts
+        # Amounts: only from payment nodes or currency-labelled nodes
+        for amt_raw in re.findall(r"\d{1,3}(?:,\d{3})+|\d{4,}", label_str):
+            normalized = amt_raw.replace(",", "")
+            if re.fullmatch(r"(?:19|20)\d{2}", normalized): continue  # year
+            if re.fullmatch(r"\d{8}", normalized):           continue  # date
+            if is_payment or has_currency:
+                all_amounts[normalized] = all_amounts.get(normalized, 0) + 1
+    # Always emit reporting deadline as a DATE_ constant even if no 8-digit in labels
+    if has_deadline and reporting_deadline_ts not in all_dates.values():
+        # Find the DDMMYYYY key that maps to reporting_deadline_ts
+        for dn in date_nodes:
+            lbl = dn.get("label", "").replace("-", "")
+            d8m = re.search(r"(\d{2})(\d{2})(\d{4})", lbl)
+            if d8m:
+                key = f"DATE_{d8m.group(1)}{d8m.group(2)}{d8m.group(3)}"
+                all_dates[key] = reporting_deadline_ts
+                break
     if all_amounts or all_dates:
         value_declarations.append("    // ── Values extracted from e-contract ────────────────────────────")
         for amt in sorted(all_amounts.keys()):
@@ -275,9 +330,8 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
     if value_declarations:
         w(value_declarations + [""])
 
-    # Build constructor (always generate for proper initialization)
-    # Create party address parameters for constructor
-    party_params = ", ".join([f"address _{_safe_id(p['id'])}" for p in parties[:6] if _safe_id(p["id"])])
+    # Build constructor — use party_pairs (same IDs as state vars and modifier)
+    party_params = ", ".join([f"address _{pid}" for pid, _ in party_pairs])
     if party_params:
         party_params = ", " + party_params
     
@@ -300,9 +354,8 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "        require(_endDate>_startDate,'end<=start');",
        f'        jurisdiction="{jurisdiction}";'])
     
-    # Assign party addresses from constructor parameters
-    for i, p in enumerate(parties[:6]):
-        pid = _safe_id(p['id'])
+    # Assign party addresses — use party_pairs (in sync with state vars)
+    for pid, _ in party_pairs:
         w([f"        {pid}=_{pid};"])
     
     # Add payment schedule initialization
@@ -325,17 +378,45 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "    }",""])
 
     if obligations or tenant_obligations:
+        # TerminationReason enum for conduct/progress-based termination clauses
+        w(["    enum TerminationReason { CONDUCT_UNSATISFACTORY, PROGRESS_UNSATISFACTORY, MUTUAL, BREACH, DEADLINE_MISSED, OTHER }",
+           ""])
+        # Reporting/joining deadline: if a DATE_DEADLINE + TERMINATION both exist,
+        # expose a reportingDeadline variable and enforce it in fulfillObligation.
+        if has_deadline:
+            w([f"    uint256 public reportingDeadline = {reporting_deadline_ts}; // Joining deadline (Unix ts)",
+               "    bool   public reportingFulfilled;",
+               "    event  DeadlineMissed(uint256 deadline, uint256 checkedAt);",
+               ""])
         w(["    function addObligation(string calldata desc,address to,uint256 deadline,bool bestEfforts) external onlyOwner whenActive returns(uint256 id){",
            "        id=obligationCount++; obligationRecords[id]=ObligationRecord(desc,ObligationStatus.PENDING,to,deadline,bestEfforts);",
            "        emit ObligationAdded(id,desc,bestEfforts);","    }",
            "    function fulfillObligation(uint256 id) external whenActive onlyParty{",
-           "        require(obligationRecords[id].status==ObligationStatus.PENDING,'Not pending');",
-           "        obligationRecords[id].status=ObligationStatus.FULFILLED; emit ObligationFulfilled(id,msg.sender);","    }",
+           "        require(obligationRecords[id].status==ObligationStatus.PENDING,'Not pending');"])
+        if has_deadline:
+            w(["        // Enforce reporting deadline — if missed, mark as breached and terminate",
+               "        if(reportingDeadline > 0 && !reportingFulfilled){",
+               "            require(block.timestamp <= reportingDeadline,'Reporting deadline passed — appointment cancelled');",
+               "            reportingFulfilled = true;",
+               "        }"])
+        w(["        obligationRecords[id].status=ObligationStatus.FULFILLED; emit ObligationFulfilled(id,msg.sender);","    }",
            "    function markObligationBreached(uint256 id) external onlyOwner{",
            "        obligationRecords[id].status=ObligationStatus.BREACHED; emit ObligationBreached(id);","    }",""])
+        # Auto-cancellation: callable by anyone after deadline passes
+        if has_deadline:
+            w(["    /// @notice Cancel appointment if intern did not report by the deadline.",
+               "    /// Mirrors clause: 'this order will be treated as cancelled'.",
+               "    function checkAndCancelIfOverdue() external {",
+               "        require(reportingDeadline > 0,'No deadline set');",
+               "        require(!reportingFulfilled,'Already reported');",
+               "        require(block.timestamp > reportingDeadline,'Deadline not yet passed');",
+               "        isTerminated = true; isActive = false;",
+               "        emit DeadlineMissed(reportingDeadline, block.timestamp);",
+               "        emit ContractTerminated('Deadline missed — appointment cancelled', block.timestamp);",
+               "    }",""])
     
-    # Add tenant-specific obligation functions
-    if tenant_obligations or obligations:
+    # Add tenant-specific obligation functions ONLY when tenant clauses exist
+    if tenant_obligations:
         w(["    function addTenantObligation(string calldata desc,uint256 deadline,bool isSublet,bool isStructural,bool isResidentialOnly) external onlyOwner returns(uint256 id){",
            "        id=tenantObligationCount++; tenantObligations[id]=TenantObligation(desc,TenantObligationStatus.PENDING,deadline,isSublet,isStructural,isResidentialOnly);","    }",
            "    function acknowledgeTenantObligation(uint256 id) external whenActive onlyParty{",
@@ -475,13 +556,11 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract", party_addresses: 
        "        require(isActive,'contract inactive');",
        "        emit FundsDeposited(msg.sender,msg.value,block.timestamp);","    }",
        "}"])
-    # Post-process: Remove any assert lines referencing 'i' outside loops (prevents undeclared identifier errors)
-    solidity_lines = []
-    for line in L:
-        # Remove lines like: assert(!(i<paymentSchedules.length)); or assert(!(!(i<paymentSchedules.length)));
-        if re.match(r"\s*assert\s*\(.*i\s*[<>=].*\)\s*;", line):
-            continue
-        solidity_lines.append(line)
+    # Post-process: Remove ALL assert(!(...)) lines.
+    # The LLM refinement loop injects assert(!(X)); assert(!(!(X))); before every require(X).
+    # These always revert BEFORE the require fires, making every transaction fail.
+    _ASSERT_RE = re.compile(r"^\s*assert\s*\(", re.IGNORECASE)
+    solidity_lines = [line for line in L if not _ASSERT_RE.match(line)]
     return "\n".join(solidity_lines)
 
 

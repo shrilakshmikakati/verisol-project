@@ -87,7 +87,7 @@ def cmd_check(_args):
         print(yellow("  Fix missing items, then re-run: python cli.py check\n"))
 
 # ── Core pipeline (synchronous, prints live progress) ─────────────────────────
-def run_pipeline(file_path: str, contract_name: str, output_dir: str):
+def run_pipeline(file_path: str, contract_name: str, output_dir: str, page_number: int = 0, page_title: str = ""):
     _setup_path()
     from core.econtract_kg    import (extract_text_from_file, extract_text_from_folder,
                                       build_econtract_knowledge_graph, graph_to_dict,
@@ -185,7 +185,7 @@ def run_pipeline(file_path: str, contract_name: str, output_dir: str):
 
     # ── Step 3: Generate Solidity ─────────────────────────────
     print_progress("Generating smart contract from KG...", update_progress())
-    initial_solidity = kg_to_solidity(ec_dict, contract_name)
+    initial_solidity = kg_to_solidity(ec_dict, contract_name, page_number=page_number, page_title=page_title)
     sol_lines = len(initial_solidity.splitlines())
     progress_state["solidity_pct"] = 100.0
     
@@ -542,59 +542,137 @@ def cmd_demo(args):
 
 # ── Run multi-page command ────────────────────────────────────────────────────
 def cmd_run_multi(args):
-    """Process multi-page DOCX: generates one smart contract per page/section."""
+    """
+    Process a multi-page .docx or .txt file.
+    Generates one independent smart contract per page/section.
+
+    Output layout inside <base_out>/:
+      <ContractName>_page1.sol      ← Solidity for page 1
+      <ContractName>_page2.sol      ← Solidity for page 2
+      …
+      page1/results.json            ← per-page metadata
+      page2/results.json
+      …
+      multi_summary.json            ← cross-page summary
+    """
     print(BANNER)
     path = Path(args.file)
     if not path.exists():
         print(red(f"  ✗  File not found: {args.file}"))
         sys.exit(1)
-    
-    # Extract pages from document
-    _setup_path()
-    from core.econtract_kg import extract_pages_from_docx
-    
-    if path.suffix.lower() != ".docx":
-        print(red(f"   run-multi only supports .docx files (got {path.suffix})"))
+
+    ext = path.suffix.lower()
+    if ext not in (".docx", ".txt"):
+        print(red(f"  ✗  run-multi supports .docx and .txt files only (got {ext})"))
         sys.exit(1)
-    
-    pages = extract_pages_from_docx(str(path))
+
+    _setup_path()
+    from core.econtract_kg import extract_pages_from_file
+
+    pages = extract_pages_from_file(str(path))
     if not pages:
-        print(yellow(f"   Document doesn't have multiple pages/sections, using single-page mode"))
-        print(f"     (Use 'python cli.py run' instead)\n")
+        print(yellow("  ⚠  Could not detect multiple pages/sections in this file."))
+        print(f"     Use {cyan('python cli.py run')} for single-page documents.\n")
         return
-    
+
     base_name = args.name or path.stem.replace(" ", "_") or "Contract"
-    base_out  = args.output or f"./Result/{base_name}_multi"
-    
-    print(f"  {bold('Input')}   {cyan(str(path.resolve()))}")
-    print(f"  {bold('Pages')}   {cyan(str(len(pages)))}")
-    print(f"  {bold('Output')}  {cyan(str(Path(base_out).resolve()))}\n")
-    
-    # Process each page as separate contract
+    base_out  = Path(args.output or f"./Results/{base_name}_multi")
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    total = len(pages)
+    print(f"  {bold('Input')}    {cyan(str(path.resolve()))}")
+    print(f"  {bold('Pages')}    {cyan(str(total))}")
+    print(f"  {bold('Output')}   {cyan(str(base_out.resolve()))}\n")
+
+    # ── Process each page ────────────────────────────────────────────────────
+    page_results: list = []   # collect summary rows
+
     for page_num, content, title in pages:
-        page_name = f"{base_name}_page{page_num}"
-        page_out  = f"{base_out}/{page_name}"
-        
-        print(f"\n{cyan('─'*60)}")
-        print(f"    Page {page_num}/{len(pages)}  {dim(title[:40])}")
-        print(f"{cyan('─'*60)}\n")
-        
-        # Create temp file for this page
-        temp_file = Path(page_out) / "temp.txt"
-        temp_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file.write_text(content)
-        
+        page_label = f"page{page_num}"
+        # Contract name embeds page number: e.g. ServiceAgreement_page2
+        contract_name = f"{base_name}_{page_label}"
+        # Each page gets its own sub-directory for metadata / graphs
+        page_out_dir  = base_out / page_label
+        page_out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n{cyan('═' * 62)}")
+        print(f"  {bold(f'PAGE {page_num} / {total}')}  {dim(title[:50])}")
+        print(f"{cyan('═' * 62)}\n")
+
+        # Write page content to a temp .txt so run_pipeline can read it
+        temp_txt = page_out_dir / "_page_content.txt"
+        temp_txt.write_text(content, encoding="utf-8")
+
+        sol_path = None
+        accuracy = None
+        status   = "ERROR"
         try:
-            run_pipeline(str(temp_file), page_name, page_out)
-        except Exception as e:
-            print(red(f"\n  ✗  Error processing page {page_num}: {str(e)[:80]}"))
-            continue
+            sol_path = run_pipeline(str(temp_txt), contract_name, str(page_out_dir), page_number=page_num, page_title=title)
+
+            # run_pipeline writes <contract_name>.sol inside page_out_dir.
+            # Copy it up to base_out with a clear page-numbered name.
+            generated_sol = page_out_dir / f"{contract_name}.sol"
+            final_sol     = base_out / f"{contract_name}.sol"
+            if generated_sol.exists():
+                import shutil as _sh
+                _sh.copy2(generated_sol, final_sol)
+
+            # Pull accuracy from the results.json written by run_pipeline
+            rj = page_out_dir / "results.json"
+            if rj.exists():
+                rd = json.loads(rj.read_text())
+                accuracy = rd.get("final_comparison", {}).get("accuracy")
+                is_valid = rd.get("final_comparison", {}).get("is_validated", False)
+                status   = "✓ VALIDATED" if is_valid else "⚠ PARTIAL"
+
+            page_results.append({
+                "page":          page_num,
+                "title":         title[:60],
+                "contract_name": contract_name,
+                "sol_file":      str(final_sol.name) if final_sol.exists() else "—",
+                "accuracy":      accuracy,
+                "status":        status,
+            })
+
+        except Exception as exc:
+            print(red(f"\n  ✗  Error on page {page_num}: {str(exc)[:100]}"))
+            page_results.append({
+                "page":          page_num,
+                "title":         title[:60],
+                "contract_name": contract_name,
+                "sol_file":      "—",
+                "accuracy":      None,
+                "status":        "ERROR",
+            })
         finally:
-            # Clean up temp file
-            if temp_file.exists():
-                temp_file.unlink()
-    
-    print(f"\n{green('✓')} All pages processed! Check {base_out} for results.")
+            if temp_txt.exists():
+                temp_txt.unlink()
+
+    # ── Write cross-page summary JSON ────────────────────────────────────────
+    summary = {
+        "source_file":    str(path.resolve()),
+        "base_name":      base_name,
+        "total_pages":    total,
+        "generated_at":   datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "pages":          page_results,
+    }
+    summary_path = base_out / "multi_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    # ── Print summary table ──────────────────────────────────────────────────
+    print(f"\n\n{'═' * 62}")
+    print(f"  {bold('MULTI-PAGE SUMMARY')}  ({total} pages → {total} smart contracts)\n")
+    print(f"  {'Page':<6}  {'Accuracy':<10}  {'Status':<16}  {'Output File'}")
+    print(f"  {'─'*4}  {'─'*8}  {'─'*14}  {'─'*30}")
+    for row in page_results:
+        acc_str = f"{round(row['accuracy'], 1)}%" if row['accuracy'] is not None else "—"
+        st      = row["status"]
+        color_f = green if "VALIDATED" in st else (yellow if "PARTIAL" in st else red)
+        print(f"  {str(row['page']):<6}  {acc_str:<10}  {color_f(st):<25}  {dim(row['sol_file'])}")
+
+    print(f"\n  {bold('Output directory')}  {cyan(str(base_out.resolve()))}")
+    print(f"  {bold('Summary JSON')}      {cyan(str(summary_path))}")
+    print(f"{'═' * 62}\n")
 
 
 # ── Run command ───────────────────────────────────────────────────────────────
@@ -624,6 +702,7 @@ def main():
             python cli.py run       --file contract.docx       --name NDA --output ./out
             python cli.py run       --file scan.png            --name ImageContract
             python cli.py run-multi --file multipage.docx      --name Contracts
+            python cli.py run-multi --file multipage.txt       --name Contracts
             python cli.py demo
             python cli.py check
         """)
@@ -635,8 +714,8 @@ def main():
     p_run.add_argument("--name",   default="",    help="Contract name (default: filename stem)")
     p_run.add_argument("--output", default="",    help="Output directory (default: ./Results/<name>)")
 
-    p_multi = sub.add_parser("run-multi", help="Process multi-page DOCX (separate contract per page)")
-    p_multi.add_argument("--file",   required=True, help="Path to .docx file with multiple pages/sections")
+    p_multi = sub.add_parser("run-multi", help="Process multi-page .docx or .txt (one contract per page)")
+    p_multi.add_argument("--file",   required=True, help="Path to .docx or .txt with multiple pages/sections")
     p_multi.add_argument("--name",   default="",    help="Base contract name for all pages")
     p_multi.add_argument("--output", default="",    help="Output directory (default: ./Results/<name>_multi)")
 

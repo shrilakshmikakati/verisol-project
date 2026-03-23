@@ -34,7 +34,8 @@ def get_nlp():
         except Exception:
             pass
     import subprocess
-    subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=True)
+    import sys
+    subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=True)
     _nlp = spacy.load("en_core_web_sm")
     return _nlp
 
@@ -464,30 +465,61 @@ PAYMENT_PATTERNS = [
 ]
 
 def normalize_date(date_str: str) -> str:
-    """Normalize various date formats to YYYY-MM-DD for comparison."""
+    """
+    Normalize date string to canonical DDMMYYYY form used as the KEY
+    for DATE_ constants in generated Solidity.
+
+    Handles: DDMMYYYY, YYYYMMDD, DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD,
+             named months (e.g. '8 August 2025').
+
+    Returns DDMMYYYY string (e.g. '08082025') so that:
+      - node label  = 'date_08082025'
+      - Solidity constant = DATE_08082025 = <unix_ts>
+      - Tier C can find '08082025' as substring of 'DATE_08082025'
+    """
     date_str = date_str.strip()
-    
-    # Try DDMMYYYY format (8 consecutive digits)
+
+    # ── DDMMYYYY (8 digits, day <= 31 and month <= 12) ───────────────────────
     if re.match(r"^\d{8}$", date_str):
+        # Try DDMMYYYY first
         try:
             d = dt.strptime(date_str, "%d%m%Y")
-            return d.strftime("%Y-%m-%d")
-        except:
+            return d.strftime("%d%m%Y")          # canonical DDMMYYYY
+        except ValueError:
             pass
-    
-    # Try DD/MM/YYYY or DD-MM-YYYY
+        # Try YYYYMMDD (spaCy often outputs dates in this order)
+        try:
+            d = dt.strptime(date_str, "%Y%m%d")
+            return d.strftime("%d%m%Y")          # convert to DDMMYYYY
+        except ValueError:
+            pass
+
+    # ── DD/MM/YYYY or DD-MM-YYYY ─────────────────────────────────────────────
     if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{4}$", date_str):
         try:
             d = dt.strptime(date_str.replace("-", "/"), "%d/%m/%Y")
-            return d.strftime("%Y-%m-%d")
-        except:
+            return d.strftime("%d%m%Y")
+        except ValueError:
             pass
-    
-    # Try YYYY-MM-DD
+
+    # ── YYYY-MM-DD (ISO) ─────────────────────────────────────────────────────
     if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
-        return date_str
-    
-    # Return as-is if no pattern matched
+        try:
+            d = dt.strptime(date_str, "%Y-%m-%d")
+            return d.strftime("%d%m%Y")
+        except ValueError:
+            pass
+
+    # ── Named month formats: "8 August 2025", "August 8, 2025" ──────────────
+    for fmt in ("%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y",
+                "%B %d %Y",  "%b %d %Y"):
+        try:
+            d = dt.strptime(date_str, fmt)
+            return d.strftime("%d%m%Y")
+        except ValueError:
+            pass
+
+    # Return as-is (caller handles)
     return date_str
 
 DATE_PATTERNS = [
@@ -826,16 +858,15 @@ def build_econtract_knowledge_graph(raw_text: str) -> nx.DiGraph:
         if not val:
             continue
         
-        # Normalize date values for better matching
+        # Normalize date values — canonical form is DDMMYYYY (matches Solidity DATE_ key)
         if e["type"] == "DATE_DEADLINE":
-            normalized = normalize_date(val)
-            nid = normalized[:60]
-            # Create better labels for dates
-            if re.search(r"\d{8}", val):
-                label = f"date_{normalized}"
-            elif re.search(r"\d+\s+(?:days?|months?|years?|weeks?)", val, re.I):
+            normalized = normalize_date(val)  # returns DDMMYYYY or original
+            nid   = normalized[:60]
+            if re.search(r"\d+\s+(?:days?|months?|years?|weeks?)", val, re.I):
                 label = f"duration_{nid}"
             else:
+                # label contains the DDMMYYYY key so Tier C finds it as substring
+                # of 'DATE_DDMMYYYY' in Solidity code
                 label = f"date_{normalized}"
         else:
             nid = val[:60]

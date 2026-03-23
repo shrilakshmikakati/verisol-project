@@ -269,16 +269,33 @@ def _tier_c_value_coverage(G_e: nx.DiGraph, G_s: nx.DiGraph, solidity_code: str 
     # Now we have both extracted values AND solidity code
     # Normalize code: remove spaces and commas for cleaner matching
     search_space = solidity_code.replace(",", "").replace(" ", "")
-    
-    # Count how many extracted values appear in generated code
+
+    # Build a secondary search space that also contains Unix timestamps derived
+    # from DDMMYYYY date labels — so DATE_08082025 node with label "date_2025-08-08"
+    # is found even when the code stores it as timestamp 1754611200.
+    from datetime import datetime as _dt
+    ts_aliases: dict = {}   # raw_digit_str -> set of also-acceptable strings
+    for n in G_e.nodes if hasattr(G_e, "nodes") else []:
+        pass  # G_e not available here; handled in caller
+    # Simple heuristic: for every 8-digit value, try DDMMYYYY -> timestamp
+    for val in list(extracted_values):
+        if len(val) == 8 and val.isdigit():
+            try:
+                dd, mm, yyyy = int(val[:2]), int(val[2:4]), int(val[4:])
+                if 1 <= mm <= 12 and 1 <= dd <= 31 and 1970 <= yyyy <= 2100:
+                    ts = str(int(_dt(yyyy, mm, dd).timestamp()))
+                    ts_aliases[val] = ts
+            except Exception:
+                pass
+
     found_count = 0
-    found_values = []
     for value in extracted_values:
-        if value in search_space:  # Simple substring check
+        if value in search_space:
             found_count += 1
-            found_values.append(value)
-    
-    # Return realistic percentage
+        elif value in ts_aliases and ts_aliases[value] in search_space:
+            # Date found as its Unix timestamp equivalent
+            found_count += 1
+
     coverage_pct = round((found_count / len(extracted_values)) * 100, 2)
     return coverage_pct
 
@@ -507,14 +524,9 @@ def _merge_patch(base_code: str, patch: str) -> str:
         patch = contract_body.group(1).strip()
 
   
-    patch_lines = []
-    for line in patch.split('\n'):
-        stripped = line.strip()
-        if stripped.startswith('assert(') and re.search(r'\bi\s*[<>=]', stripped):
-            continue
-        patch_lines.append(line)
-    
-    patch = '\n'.join(patch_lines).strip()
+    _assert_re = re.compile(r"^\s*assert\s*\(", re.IGNORECASE)
+    patch_lines = [line for line in patch.split("\n") if not _assert_re.match(line)]
+    patch = "\n".join(patch_lines).strip()
 
     patch = patch.strip()
     if not patch:
@@ -764,7 +776,7 @@ All unmatched labels have been resolved: {len(unmatched) == 0}
 
 
 
-def _ollama_patch(prompt: str) -> str:
+def _ollama_patch(prompt: str, temperature: float = 0.1) -> str:
     """Call Ollama and extract the patch fragment. Retry on failure."""
     max_retries = 2
     for attempt in range(max_retries):
@@ -773,8 +785,8 @@ def _ollama_patch(prompt: str) -> str:
                 "model":   OLLAMA_MODEL,
                 "prompt":  prompt,
                 "stream":  False,
-                "options": {"temperature": 0.1, "num_predict": 2048},
-            }, timeout=60)  # 60s per attempt; total budget = 120s for 2 retries
+                "options": {"temperature": temperature, "num_predict": 2048},
+            }, timeout=60)
             resp.raise_for_status()
             raw = resp.json().get("response", "")
             patch = _extract_patch_only(raw)
@@ -846,16 +858,21 @@ def refinement_loop(
             G_e                 = G_e,
         )
 
-        patch = _ollama_patch(prompt)
+        # Escalate temperature when stalling to break deterministic LLM loops:
+        # iter 1-2 → 0.1 (precise), iter 3-4 → 0.3 (varied), iter 5 → 0.5 (creative)
+        temperature = 0.1 if iteration <= 2 else (0.3 if iteration <= 4 else 0.5)
+        patch = _ollama_patch(prompt, temperature=temperature)
 
         # Track if we're getting patches or not
         if not patch:
             consecutive_no_patch_count += 1
-            # If 3 iterations in a row with no patches AND we've done minimum iterations, we can exit early
-            if consecutive_no_patch_count >= 3 and iteration >= min_iterations:
+            # Only exit early if accuracy is reasonable OR all important types covered
+            missing_types = cmp_current.get("type_coverage", {}).get("missing_semantic", [])
+            can_exit_early = (best_accuracy >= 80.0 or not missing_types)
+            if consecutive_no_patch_count >= 3 and iteration >= min_iterations and can_exit_early:
                 break
         else:
-            consecutive_no_patch_count = 0  # Reset counter when we get a patch
+            consecutive_no_patch_count = 0
         
         if patch:
             candidate = _merge_patch(best_code, patch)
