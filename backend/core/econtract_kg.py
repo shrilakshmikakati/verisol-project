@@ -1,359 +1,233 @@
 """
 Algorithm 1: E-Contract Knowledge Graph
-Improvements in this version:
- - ENTITY BLOCKLIST: filters out noise words (mobile, pi, dt, ref, etc.)
- - CARDINAL removed from spaCy PAYMENT map (grabbed phone/roll numbers)
- - Payment patterns tightened to require currency symbol or stipend keyword
- - Devanagari/non-ASCII stripped before matplotlib rendering (suppresses font warnings)
- - Semantic edge fuzzy lookup uses subtree phrase matching, not single token
- - _link_obligations_to_parties uses sentence-window proximity
- - Party pattern min-length enforced (>= 3 chars after blocklist)
+Supports .docx and .txt files only.
+Multi-page detection → NLP entity extraction → KG build → PNG render.
+
+Page-detection strategies (priority order):
+  DOCX: 1) Word section breaks  2) Explicit page-break XML  3) Heading styles  4) Adaptive char-count
+  TXT:  1) Form-feed \\f         2) Heading-separated blocks  3) Adaptive char-count
 """
-import re, io, base64, warnings, datetime
-from datetime import datetime as dt, timedelta
-import spacy
-import networkx as nx
-import matplotlib
-matplotlib.use("Agg")
+import re, io, base64, warnings
+from datetime import datetime as dt
+from pathlib import Path
+import spacy, networkx as nx
+import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from pathlib import Path
 
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
+# ── spaCy loader ──────────────────────────────────────────────────────────────
 _nlp = None
-
 def get_nlp():
     global _nlp
-    if _nlp is not None:
-        return _nlp
-    for model in ("en_core_web_lg", "en_core_web_md", "en_core_web_sm"):
-        try:
-            _nlp = spacy.load(model)
-            return _nlp
-        except Exception:
-            pass
-    import subprocess
-    import sys
+    if _nlp: return _nlp
+    for m in ("en_core_web_lg", "en_core_web_md", "en_core_web_sm"):
+        try: _nlp = spacy.load(m); return _nlp
+        except Exception: pass
+    import subprocess, sys
     subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=True)
-    _nlp = spacy.load("en_core_web_sm")
-    return _nlp
+    _nlp = spacy.load("en_core_web_sm"); return _nlp
 
-# ── Text Extraction ────────────────────────────────────────────────────────────
-
+# ── Text extraction ───────────────────────────────────────────────────────────
 def extract_text_from_docx(path: str) -> str:
-    """
-    Comprehensive docx text extractor.
-    Reads in this order (preserving document flow):
-      1. Header of each section
-      2. Body paragraphs and tables (XML walk, no deduplication)
-      3. Footer of each section
-      4. Text boxes / drawing frames
-      5. Footnotes / endnotes
-      6. Core properties (title, author, subject)
-    NO deduplication — every paragraph kept in order.
-    Falls back to raw XML scrape if result is under 300 chars.
-    """
     from docx import Document
     from docx.oxml.ns import qn
-    import lxml.etree as etree
+    doc = Document(path); parts = []
 
-    doc   = Document(path)
-    parts = []
-
-    def _para_text(elem) -> str:
+    def _pt(elem):
         return "".join(n.text or "" for n in elem.iter(qn("w:t")))
 
-    def _walk_body(elem):
-        """Walk XML element, yielding text from paragraphs and table cells."""
-        for child in elem:
-            local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-            if local == "p":
-                t = _para_text(child).strip()
-                if t:
-                    parts.append(t)
-            elif local == "tbl":
-                _walk_table(child)
-            elif local in ("sdt",):
-                # Content controls — recurse into sdtContent
-                for content in child:
-                    cl = content.tag.split("}")[-1] if "}" in content.tag else content.tag
-                    if cl in ("sdtContent", "sdtBody"):
-                        _walk_body(content)
-            elif local in ("drawing", "pict", "object", "txbxContent"):
-                # Text boxes and drawings
-                for t_node in child.iter(qn("w:t")):
-                    if t_node.text and t_node.text.strip():
-                        parts.append(t_node.text.strip())
+    def _walk(elem):
+        for c in elem:
+            loc = c.tag.split("}")[-1] if "}" in c.tag else c.tag
+            if loc == "p":
+                t = _pt(c).strip()
+                if t: parts.append(t)
+            elif loc == "tbl":
+                for tr in c.findall(".//" + qn("w:tr")):
+                    row = [" ".join(_pt(p).strip() for p in tc.findall(".//" + qn("w:p"))
+                                    if _pt(p).strip())
+                           for tc in tr.findall(".//" + qn("w:tc"))]
+                    if any(row): parts.append(" | ".join(r for r in row if r))
             else:
-                # Recurse for any other container elements
-                _walk_body(child)
+                _walk(c)
 
-    def _walk_table(tbl_elem):
-        for tr in tbl_elem.findall(".//" + qn("w:tr")):
-            row_parts = []
-            for tc in tr.findall(".//" + qn("w:tc")):
-                cell_text_parts = []
-                for p in tc.findall(".//" + qn("w:p")):
-                    t = _para_text(p).strip()
-                    if t:
-                        cell_text_parts.append(t)
-                if cell_text_parts:
-                    row_parts.append(" ".join(cell_text_parts))
-            if row_parts:
-                parts.append(" | ".join(row_parts))
-
-    def _extract_from_part(part_element):
-        """Extract text from a document part element (header/footer/body)."""
-        if part_element is not None:
-            _walk_body(part_element)
-
-    # 1. Section headers
-    for section in doc.sections:
-        try:
-            hdr = section.header
-            if hdr and not hdr.is_linked_to_previous:
-                _extract_from_part(hdr._element.body if hasattr(hdr._element, 'body') else hdr._element)
-        except Exception:
-            pass
-
-    # 2. Main body (primary extraction)
-    _walk_body(doc.element.body)
-
-    # 3. Section footers
-    for section in doc.sections:
-        try:
-            ftr = section.footer
-            if ftr and not ftr.is_linked_to_previous:
-                _extract_from_part(ftr._element.body if hasattr(ftr._element, 'body') else ftr._element)
-        except Exception:
-            pass
-
-    # 4. Footnotes and endnotes (if present)
-    _FOOTNOTE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
-    _ENDNOTE_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes"
-    for rel_type in (_FOOTNOTE_REL, _ENDNOTE_REL):
-        try:
-            part = doc.part.package.part_related_by(rel_type)
-            if part:
-                _walk_body(etree.fromstring(part.blob))
-        except Exception:
-            pass
-
-    # 5. Core properties
-    try:
-        cp = doc.core_properties
-        for attr in ("title", "subject", "description", "author", "keywords"):
-            val = getattr(cp, attr, None)
-            if val and str(val).strip():
-                parts.append("[META] " + str(val).strip())
-    except Exception:
-        pass
-
-    full_text = "\n".join(p for p in parts if p.strip())
-
-    # Fallback: raw XML scrape if structured walk gave very little
-    if len(full_text.replace("\n", "").strip()) < 300:
-        try:
-            raw_xml  = etree.tostring(doc.element, encoding="unicode")
-            raw_text = re.sub(r"<[^>]+>", " ", raw_xml)
-            raw_text = re.sub(r"\s+", " ", raw_text).strip()
-            if len(raw_text) > len(full_text):
-                return raw_text
-        except Exception:
-            pass
-
-    return full_text
-
-def extract_text_from_image(path: str) -> str:
-    import pytesseract
-    from PIL import Image, ImageFilter, ImageEnhance
-    img = Image.open(path).convert("L")
-    img = ImageEnhance.Contrast(img).enhance(2.0)
-    img = img.filter(ImageFilter.SHARPEN)
-    best = ""
-    for cfg in ["--psm 6", "--psm 4", "--psm 3"]:
-        try:
-            t = pytesseract.image_to_string(img, config=cfg)
-            if len(t) > len(best):
-                best = t
-        except Exception:
-            pass
-    return best
+    _walk(doc.element.body)
+    return "\n".join(p for p in parts if p.strip())
 
 def extract_text_from_file(path: str) -> str:
     ext = Path(path).suffix.lower()
     if ext == ".docx":
-        # Try multiple extraction methods and use the longest result
-        methods = [extract_text_from_docx]
-        try:
-            import zipfile as _zf
-            # Alternative method 1: direct zipfile extraction
-            def alt1(p):
-                with _zf.ZipFile(p) as z:
-                    xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
-                    raw = re.sub(r'<[^>]+>', ' ', xml)
-                    # Pre-clean XML artifact numbers before length comparison
-                    raw = re.sub(r'(?:\b\d{6,}\b\s*){2,}', ' ', raw)
-                    raw = re.sub(r'\s+', ' ', raw).strip()
-                    return raw
-            methods.append(alt1)
-        except:
-            pass
-        
-        results = []
-        for method in methods:
-            try:
-                text = method(path)
-                if text and len(text.strip()) > 100:
-                    results.append(text)
-            except:
-                pass
-        
-        if results:
-            # Return longest extraction
-            return max(results, key=lambda x: len(x.replace('\n', '').replace(' ', '')))
-        return ""
-    
-    if ext in (".png", ".jpg", ".jpeg", ".tiff", ".bmp"):
-        return extract_text_from_image(path)
+        return extract_text_from_docx(path)
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
+# ── Multi-page extraction: DOCX ───────────────────────────────────────────────
 def extract_pages_from_docx(path: str) -> list:
-    """
-    Extract pages/sections from multi-page DOCX.
-    Returns list of (page_num, content, title) tuples
-    
-    Detection strategy (in order of preference):
-    1. Heading styles (Heading 1, 2, 3, etc.) - must have 2+
-    2. Title-style paragraphs - must have 2+
-    3. Physical page estimation (adaptively: document_chars / 7 sections as default)
-    """
+    """Returns list of (page_num, content, title). .docx only."""
     try:
         from docx import Document
-    except:
+        from docx.oxml.ns import qn as _qn
+    except ImportError:
         return []
-    
-    doc = Document(path)
-    if not doc.paragraphs:
-        return []
-    
-    # Strategy 1: Detect explicit heading styles
-    heading_markers = []
-    for i, para in enumerate(doc.paragraphs):
-        style = para.style.name if para.style else ""
-        text = para.text.strip()
-        
-        # Only Heading 1, 2, 3 - stricter filtering
-        if any(h in style for h in ["Heading 1", "Heading 2", "Heading 3"]) and text:
-            heading_markers.append((i, text))
-    
-    # Use headings ONLY if:
-    # 1. We have 3+ distinct heading markers, OR
-    # 2. We have 2+ headings with significantly different text (not duplicates)
-    use_headings = False
-    if len(heading_markers) >= 3:
-        use_headings = True
-    elif len(heading_markers) == 2:
-        # Check if headers are meaningfully different
-        h1_text = heading_markers[0][1]
-        h2_text = heading_markers[1][1]
-        if h1_text != h2_text:  # Only use if headers are different
-            use_headings = True
-    
-    if use_headings:
+
+    doc = Document(path); paras = doc.paragraphs
+    if not paras: return []
+
+    def _build_pages(chunks):
         pages = []
-        for section_idx, (start_idx, title_text) in enumerate(heading_markers):
-            next_idx = heading_markers[section_idx + 1][0] if section_idx + 1 < len(heading_markers) else len(doc.paragraphs)
-            
-            section_text = []
-            for para_idx in range(start_idx, next_idx):
-                para = doc.paragraphs[para_idx]
-                if para.text.strip():
-                    section_text.append(para.text)
-            
-            if section_text:
-                content = "\n".join(section_text)
-                pages.append((section_idx + 1, content, title_text[:50]))
-        
+        for lines in chunks:
+            content = "\n".join(l for l in lines if l.strip())
+            if len(content) < 200: continue
+            title = next((l.strip()[:50] for l in lines
+                          if l.strip() and any(c.isascii() and c.isalpha() for c in l)),
+                         f"Page {len(pages)+1}")
+            pages.append((len(pages)+1, content, title))
         return pages
-    
-    # Strategy 2: Physical page estimation with adaptive chunking
-    # Use character count ONLY — Word margin/header sections != logical contracts
-    # A single-contract doc with a different first-page header has 2 Word sections,
-    # so num_word_sections must never be used as a split heuristic.
-    total_chars = sum(len(p.text) for p in doc.paragraphs)
 
-    if total_chars > 8000:
-        chars_per_page = 3000
-    elif total_chars > 4000:
-        chars_per_page = 2000
+    # Strategy 1: Word section breaks (<w:sectPr> inside <w:pPr>)
+    s_chunks, cur = [], []
+    for para in paras:
+        if para.text.strip(): cur.append(para.text)
+        pPr = para._element.find(_qn("w:pPr"))
+        if pPr is not None and pPr.find(_qn("w:sectPr")) is not None:
+            s_chunks.append(cur[:]); cur = []
+    if cur: s_chunks.append(cur)
+    pages = _build_pages(s_chunks)
+    if len(pages) >= 2: return pages
+
+    # Strategy 2: Explicit page-break XML markers
+    pb_chunks, cur = [], []
+    for para in paras:
+        xml = para._element.xml if hasattr(para._element, "xml") else ""
+        if ("lastRenderedPageBreak" in xml or 'w:type="page"' in xml) and cur:
+            pb_chunks.append(cur[:]); cur = []
+        if para.text.strip(): cur.append(para.text)
+    if cur: pb_chunks.append(cur)
+    pages = _build_pages(pb_chunks)
+    if len(pages) >= 2: return pages
+
+    # Strategy 3: Heading 1/2/3 styles
+    heading_markers = [(i, para.text.strip())
+                       for i, para in enumerate(paras)
+                       if para.style and any(h in para.style.name for h in
+                          ("Heading 1","Heading 2","Heading 3")) and para.text.strip()]
+    if len({t for _, t in heading_markers}) >= 2 or len(heading_markers) >= 3:
+        h_chunks = []
+        for j, (start, _) in enumerate(heading_markers):
+            end = heading_markers[j+1][0] if j+1 < len(heading_markers) else len(paras)
+            h_chunks.append([paras[k].text for k in range(start, end) if paras[k].text.strip()])
+        pages = _build_pages(h_chunks)
+        if len(pages) >= 2: return pages
+
+    # Strategy 4: Adaptive char-count chunking
+    total = sum(len(p.text) for p in paras)
+    cpc = 4000 if total > 16000 else 3000 if total > 8000 else 2000 if total > 4000 else 1500
+    ac_chunks, cur, count = [], [], 0
+    for para in paras:
+        t = para.text.strip()
+        if not t: continue
+        cur.append(para.text); count += len(t)
+        if count >= cpc:
+            ac_chunks.append(cur[:]); cur = []; count = 0
+    if cur: ac_chunks.append(cur)
+    pages = _build_pages(ac_chunks)
+    return pages if len(pages) >= 2 else []
+
+# ── Multi-page extraction: TXT ────────────────────────────────────────────────
+def extract_pages_from_txt(path: str) -> list:
+    """Returns list of (page_num, content, title). .txt only."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    if not raw.strip(): return []
+
+    def _build(chunks):
+        pages = []
+        for chunk in chunks:
+            content = chunk.strip()
+            if len(content) < 200: continue
+            first = next((l.strip() for l in content.splitlines() if l.strip()), "")
+            title = first[:50] if first else f"Page {len(pages)+1}"
+            pages.append((len(pages)+1, content, title))
+        return pages
+
+    # Strategy 1: form-feed character
+    if "\f" in raw:
+        pages = _build(raw.split("\f"))
+        if len(pages) >= 2: return pages
+
+    # Strategy 2: heading-separated blocks (3+ blank lines)
+    blocks = re.split(r"\n{3,}", raw)
+    if len(blocks) >= 2:
+        heading_re = re.compile(
+            r"^(?:[A-Z][A-Z\s\-:,\.]{3,}|[A-Z][a-z][\w\s\-:,\.]{3,}|\d+[\.\-\)]\s+\S)"
+        )
+        starts = [i for i, b in enumerate(blocks)
+                  if heading_re.match(next((l.strip() for l in b.splitlines() if l.strip()), ""))]
+        if len(starts) >= 2:
+            chunks = ["\n\n".join(blocks[s: starts[j+1] if j+1 < len(starts) else len(blocks)])
+                      for j, s in enumerate(starts)]
+            pages = _build(chunks)
+            if len(pages) >= 2: return pages
+
+    # Strategy 3: adaptive char-count chunking
+    total = len(raw)
+    cpc = 4000 if total > 16000 else 3000 if total > 8000 else 2000 if total > 4000 else 1500
+    lines = raw.splitlines()
+    chunks, cur, count = [], [], 0
+    for line in lines:
+        cur.append(line); count += len(line)
+        if count >= cpc:
+            chunks.append("\n".join(cur)); cur = []; count = 0
+    if cur: chunks.append("\n".join(cur))
+    pages = _build(chunks)
+    return pages if len(pages) >= 2 else []
+
+# ── Unified entry point ───────────────────────────────────────────────────────
+def extract_pages_from_file(path: str, *, fallback_single: bool = False) -> list:
+    """
+    Dispatches to extract_pages_from_docx or extract_pages_from_txt.
+    Only .docx and .txt are supported — all other extensions return [].
+    If fallback_single=True and no split is detected, returns
+    [(1, full_text, title)] so callers always get at least one page.
+    """
+    p = Path(path); ext = p.suffix.lower()
+    if ext == ".docx":
+        pages = extract_pages_from_docx(path)
+    elif ext == ".txt":
+        pages = extract_pages_from_txt(path)
     else:
-        chars_per_page = 1200
-    
-    pages = []
-    current_page = []
-    page_num = 1
-    page_char_count = 0
-    
-    for para in doc.paragraphs:
-        if para.text.strip():
-            current_page.append(para.text)
-            page_char_count += len(para.text)
-            
-            if page_char_count >= chars_per_page:
-                content = "\n".join(current_page)
-                title = current_page[0][:50] if current_page else f"Page {page_num}"
-                pages.append((page_num, content, title))
-                current_page = []
-                page_char_count = 0
-                page_num += 1
-    
-    # Don't lose the last page
-    if current_page:
-        content = "\n".join(current_page)
-        title = current_page[0][:50] if current_page else f"Page {page_num}"
-        pages.append((page_num, content, title))
-    
-    return pages if len(pages) > 1 else []
+        return []
+    if pages: return pages
+    if fallback_single: return _single_page_fallback(path)
+    return []
 
-def extract_text_from_folder(folder: str) -> str:
-    texts = []
-    for p in sorted(Path(folder).iterdir()):
-        if p.suffix.lower() in (".txt", ".docx", ".png", ".jpg", ".jpeg"):
-            texts.append(extract_text_from_file(str(p)))
-    return "\n\n".join(texts)
+def _single_page_fallback(path: str) -> list:
+    try: text = extract_text_from_file(path).strip()
+    except Exception: return []
+    if not text: return []
+    first = next((l.strip() for l in text.splitlines() if l.strip()), "Document")
+    return [(1, text, first[:60])]
 
-# ── Preprocessing ──────────────────────────────────────────────────────────────
-
+# ── Preprocessing ─────────────────────────────────────────────────────────────
 def preprocess_text(text: str) -> str:
-    """Clean text: remove XML garbage but KEEP dates with 8 digits, fix quotes."""
-    # Pass 1: strip Devanagari / non-ASCII noise early so digit patterns below
-    # are not disrupted by mixed Unicode sequences
     text = re.sub(r'[\u0900-\u097F\u4e00-\u9fff]+', ' ', text)
-    # Pass 2: remove runs of 2+ whitespace-separated 6-digit sequences
-    # These are DOCX XML artifact IDs like "640490    193675"
-    # Loop until stable (multiple passes handle 3+ sequences in a row)
     for _ in range(4):
         prev = text
         text = re.sub(r'(?:\b\d{6,}\b\s*){2,}', ' ', text)
-        if text == prev:
-            break
-    # Pass 3: remove any remaining isolated 6-digit sequences not part of 8-digit dates
+        if text == prev: break
     text = re.sub(r'(?<!\d)\d{6}(?![\d/\-])', '', text)
-    # Fix smart quotes
     text = text.replace("\u2019","'").replace("\u2018","'")
     text = text.replace("\u201c",'"').replace("\u201d",'"')
     text = text.replace("\u2013","-").replace("\u2014"," - ")
-    # Remove XML entity codes
     text = re.sub(r'&#?\w+;', '', text)
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    return re.sub(r'\s+', ' ', text).strip()
 
 def _ascii_label(s: str) -> str:
-    """Strip non-ASCII (Devanagari, CJK, etc.) for matplotlib rendering."""
     clean = re.sub(r"[^\x00-\x7F]+", "?", s)
     clean = re.sub(r"\s+", " ", clean).strip()
     return clean[:30] if clean.replace("?","").strip() else s[:20]
@@ -370,508 +244,288 @@ def detect_language(text: str) -> str:
     }
     return max(scores, key=scores.get)
 
-# ── Entity Blocklist ───────────────────────────────────────────────────────────
-# Words that pattern-match as entities but are just noise/formatting artefacts
-
+# ── Entity Blocklist ──────────────────────────────────────────────────────────
 ENTITY_BLOCKLIST = {
-    # Document formatting
     "mobile","phone","email","fax","tel","no","ref","date","sir","dear",
     "sub","madam","regards","yours","sincerely","faithfully","truly",
-    # Prepositions / conjunctions
     "the","and","for","from","to","in","of","on","at","by","is","be",
-    "as","an","or","if","re","a","an","it","its","this","that","these",
-    # Common abbreviations that slip through
-    # NOTE: "dt" intentionally removed — it appears in party names like Sangharatna_Godboley_Dt
+    "as","an","or","if","re","a","it","its","this","that","these",
     "pi","pg","ug","mr","ms","dr","st","nd","rd","th",
     "etc","viz","ie","eg","nb","pp","cf","vs","op","id",
-    # Indian official document noise
-    "govt","estt","sno","sl","sr","no","ref","reg","sub","advt",
-    "circular","office","order","letter","memo","minutes",
+    "govt","estt","sno","sl","sr","advt","circular","office","order",
+    "letter","memo","minutes",
 }
 
 def _is_valid_entity(val: str, etype: str) -> bool:
-    """Return True if this value should be kept as a node."""
-    val_stripped = val.strip()
-    val_lower    = val_stripped.lower()
-
-    # Minimum length: 3 chars for all, 4 for PARTY
+    v = val.strip(); vl = v.lower()
     min_len = 4 if etype == "PARTY" else 3
-    if len(val_stripped) < min_len:
-        return False
-
-    # Blocklist check (exact lowercase match)
-    if val_lower in ENTITY_BLOCKLIST:
-        return False
-
-    # For PARTY: reject pure numbers, phone-number patterns
+    if len(v) < min_len: return False
+    if vl in ENTITY_BLOCKLIST: return False
     if etype == "PARTY":
-        if re.fullmatch(r"[\d\s\+\-\(\)\.]+", val_stripped):
-            return False
-        if re.fullmatch(r"\d{5,}", val_stripped.replace(" ","")):
-            return False
-        # Reject single-word all-lowercase common words
-        if re.fullmatch(r"[a-z]+", val_stripped) and len(val_stripped) < 6:
-            return False
-
-    # For PAYMENT: must contain digit
-    if etype == "PAYMENT" and not re.search(r"\d", val_stripped):
-        return False
-
-    # For DATE_DEADLINE: must contain digit or date keyword
+        if re.fullmatch(r"[\d\s\+\-\(\)\.]+", v): return False
+        if re.fullmatch(r"\d{5,}", v.replace(" ","")): return False
+        if re.fullmatch(r"[a-z]+", v) and len(v) < 6: return False
+    if etype == "PAYMENT" and not re.search(r"\d", v): return False
     if etype == "DATE_DEADLINE":
-        if not re.search(r"\d", val_stripped):
-            if not re.search(r"\b(?:effective|commencement|expiry|joining|reporting|start|end)\s+date\b",
-                             val_stripped, re.I):
-                return False
-
+        if not re.search(r"\d", v):
+            if not re.search(
+                r"\b(?:effective|commencement|expiry|joining|reporting|start|end)\s+date\b",
+                v, re.I): return False
     return True
 
-# ── Pattern Library ────────────────────────────────────────────────────────────
-
+# ── Pattern Library ───────────────────────────────────────────────────────────
 PARTY_PATTERNS = [
-    # Explicit role keywords (titlecase or uppercase)
     r"\b(Buyer|Seller|Vendor|Client|Customer|Contractor|Subcontractor|"
     r"Licensor|Licensee|Franchisor|Franchisee|Lessor|Lessee|Landlord|Tenant|"
     r"Employer|Employee|Principal|Agent|Borrower|Lender|Creditor|Debtor|"
     r"Guarantor|Surety|Service\s+Provider|Service\s+Recipient|"
     r"Intern|Candidate|Supervisor|Director|Professor|Faculty|"
     r"Researcher|Scientist|Fellow|Scholar|Trainee|Apprentice)\b",
-    # Indian institutes: NIT/IIT/IIM etc. + location
-    r"\b((?:NIT|IIT|IIM|AIIMS|BITS|TIFR|ISRO|DRDO|CSIR|BARC)\s+"
-    r"[A-Za-z]+(?:\s+[A-Za-z]+)?)\b",
-    # Named orgs with legal suffix
+    r"\b((?:NIT|IIT|IIM|AIIMS|BITS|TIFR|ISRO|DRDO|CSIR|BARC)\s+[A-Za-z]+(?:\s+[A-Za-z]+)?)\b",
     r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,4})\s+"
     r"(?:Inc\.|LLC|Ltd\.|Corp\.|GmbH|S\.A\.|B\.V\.|PLC|LLP|LP|AG|SA)\b",
-    # Dr./Mr./Ms./Prof. Name  — captures the name part
     r"\b(?:Dr\.|Mr\.|Ms\.|Mrs\.|Prof\.)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})\b",
-    # Parenthetical label ("the Vendor")
     r'[("\']((?:the\s+)?[A-Z][a-zA-Z\s]{3,30})[)"\']',
 ]
-
-# PAYMENT: explicit currency or stipend/salary keyword — NO bare numbers
 PAYMENT_PATTERNS = [
-    # Currency symbol + number (with optional per-period)
     r"(?:Rs\.?\s*|INR\s*|USD\s*|\$|€|£)[\d,]+(?:\.\d{1,2})?"
     r"(?:\s*(?:/-\s*)?(?:per\s+month|p\.m\.|pm|/month|/annum|lakhs?|crores?|thousands?))?\b",
-    # "10000 per month" — explicit period
     r"\b[\d,]+(?:\.\d{1,2})?\s*(?:per\s+month|p\.m\.|/month|per\s+annum)\b",
-    # "stipend/salary of [Rs.] NNNN"
     r"\b(?:stipend|salary|remuneration|honorarium|allowance|fellowship|"
     r"emolument|wages?|pay)\s+of\s+(?:Rs\.?\s*|INR\s*)?[\d,]+\b",
-    # "consolidated stipend of Rs NNNN [per month]"
     r"\bconsolidated\s+(?:stipend|salary)\s+of\s+(?:Rs\.?\s*|INR\s*)?[\d,]+\b",
-    # "Rs. 10,000/- per month"
     r"Rs\.?\s*[\d,]+\s*(?:/-\s*)?(?:per\s+month|p\.m\.|/month)",
 ]
-
-def normalize_date(date_str: str) -> str:
-    """
-    Normalize date string to canonical DDMMYYYY form used as the KEY
-    for DATE_ constants in generated Solidity.
-
-    Handles: DDMMYYYY, YYYYMMDD, DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD,
-             named months (e.g. '8 August 2025').
-
-    Returns DDMMYYYY string (e.g. '08082025') so that:
-      - node label  = 'date_08082025'
-      - Solidity constant = DATE_08082025 = <unix_ts>
-      - Tier C can find '08082025' as substring of 'DATE_08082025'
-    """
-    date_str = date_str.strip()
-
-    # ── DDMMYYYY (8 digits, day <= 31 and month <= 12) ───────────────────────
-    if re.match(r"^\d{8}$", date_str):
-        # Try DDMMYYYY first
-        try:
-            d = dt.strptime(date_str, "%d%m%Y")
-            return d.strftime("%d%m%Y")          # canonical DDMMYYYY
-        except ValueError:
-            pass
-        # Try YYYYMMDD (spaCy often outputs dates in this order)
-        try:
-            d = dt.strptime(date_str, "%Y%m%d")
-            return d.strftime("%d%m%Y")          # convert to DDMMYYYY
-        except ValueError:
-            pass
-
-    # ── DD/MM/YYYY or DD-MM-YYYY ─────────────────────────────────────────────
-    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{4}$", date_str):
-        try:
-            d = dt.strptime(date_str.replace("-", "/"), "%d/%m/%Y")
-            return d.strftime("%d%m%Y")
-        except ValueError:
-            pass
-
-    # ── YYYY-MM-DD (ISO) ─────────────────────────────────────────────────────
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
-        try:
-            d = dt.strptime(date_str, "%Y-%m-%d")
-            return d.strftime("%d%m%Y")
-        except ValueError:
-            pass
-
-    # ── Named month formats: "8 August 2025", "August 8, 2025" ──────────────
-    for fmt in ("%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y",
-                "%B %d %Y",  "%b %d %Y"):
-        try:
-            d = dt.strptime(date_str, fmt)
-            return d.strftime("%d%m%Y")
-        except ValueError:
-            pass
-
-    # Return as-is (caller handles)
-    return date_str
-
 DATE_PATTERNS = [
-    # Standard formats
-    r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b",  # DD/MM/YYYY or DD-MM-YY
-    r"\b\d{4}-\d{2}-\d{2}\b",  # YYYY-MM-DD
-    # DDMMYYYY format - match even when concatenated to text
+    r"\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b",
+    r"\b\d{4}-\d{2}-\d{2}\b",
     r"(?:0[1-9]|[12]\d|3[01])(?:0[1-9]|1[0-2])(?:19|20)\d{2}",
-    # Named dates
     r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b",
     r"\b(?:January|February|March|April|May|June|July|August|"
     r"September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
-    # Relative dates (days, weeks, months)
     r"\b\d+\s+(?:calendar\s+)?(?:days?|business\s+days?|weeks?|months?|years?)\b",
-    # Date keywords alone
-    r"\b(?:effective|commencement|expiry|joining|reporting|start|end|before|after|during)\s+date\b",
+    r"\b(?:effective|commencement|expiry|joining|reporting|start|end|before|after)\s+date\b",
 ]
+DISPUTE_PATTERNS      = [r"\b(?:arbitration|mediation|dispute\s+resolution|governing\s+law|"
+                          r"jurisdiction|competent\s+court|ICC|AAA|UNCITRAL|LCIA|SIAC)\b"]
+CONFIDENTIAL_PATTERNS = [r"\b(?:confidential(?:ity)?|non[\s\-]?disclosure|proprietary\s+information|"
+                          r"trade\s+secret|intellectual\s+property|IP\s+rights?|copyright|patent|trademark)\b"]
+FORCE_MAJEURE_PATTERNS= [r"\b(?:force\s+majeure|act\s+of\s+God|beyond\s+(?:the\s+)?"
+                          r"(?:reasonable\s+)?control|pandemic|natural\s+disaster|"
+                          r"government\s+(?:action|order))\b"]
+MILESTONE_PATTERNS    = [r"\b(?:milestone|deliverable|phase\s+[1-9]|stage\s+[1-9]|"
+                          r"checkpoint|acceptance\s+criteria|sign[\s\-]?off|handover)\b"]
 
-DISPUTE_PATTERNS   = [
-    r"\b(?:arbitration|mediation|dispute\s+resolution|governing\s+law|"
-    r"jurisdiction|competent\s+court|ICC|AAA|UNCITRAL|LCIA|SIAC)\b",
-]
-CONFIDENTIAL_PATTERNS = [
-    r"\b(?:confidential(?:ity)?|non[\s\-]?disclosure|proprietary\s+information|"
-    r"trade\s+secret|intellectual\s+property|IP\s+rights?|copyright|patent|trademark)\b",
-]
-FORCE_MAJEURE_PATTERNS = [
-    r"\b(?:force\s+majeure|act\s+of\s+God|beyond\s+(?:the\s+)?(?:reasonable\s+)?control|"
-    r"pandemic|natural\s+disaster|government\s+(?:action|order))\b",
-]
-MILESTONE_PATTERNS = [
-    r"\b(?:milestone|deliverable|phase\s+[1-9]|stage\s+[1-9]|"
-    r"checkpoint|acceptance\s+criteria|sign[\s\-]?off|handover)\b",
-]
+OBLIGATION_KEYWORDS  = ["shall","must","is required to","agrees to","undertakes to","covenants to",
+    "is obligated to","is bound to","will provide","shall deliver","shall supply","shall report",
+    "shall complete","shall maintain","shall submit","shall perform","shall pay","shall receive",
+    "will receive","shall be paid","must report","reasonable efforts","best efforts"]
+CONDITION_KEYWORDS   = ["if and only if","provided that","subject to","on condition that",
+    "contingent upon","in the event that","unless","notwithstanding","except where",
+    "save as otherwise","to the extent that","condition precedent","failing which","in case of"]
+TERMINATION_KEYWORDS = ["terminate","termination","cancellation","rescind","void","expire","expiry",
+    "cancelled","treat as cancelled","terminable","terminated at any time",
+    "appointment is cancelled","appointment is purely temporary"]
+PENALTY_KEYWORDS     = ["penalty","liquidated damages","late fee","interest per",
+    "default interest","indemnify","indemnification","hold harmless"]
 
-OBLIGATION_KEYWORDS  = [
-    "shall","must","is required to","agrees to","undertakes to","covenants to",
-    "is obligated to","is bound to","will provide","shall deliver","shall supply",
-    "shall report","shall complete","shall maintain","shall submit","shall perform",
-    "shall pay","shall receive","will receive","shall be paid","must report",
-    "reasonable efforts","best efforts",
-]
-CONDITION_KEYWORDS   = [
-    "if and only if","provided that","subject to","on condition that",
-    "contingent upon","in the event that","unless","notwithstanding",
-    "except where","save as otherwise","to the extent that",
-    "condition precedent","failing which","in case of",
-]
-TERMINATION_KEYWORDS = [
-    "terminate","termination","cancellation","rescind","void",
-    "expire","expiry","cancelled","treat as cancelled",
-    "terminable","terminated at any time","appointment is cancelled",
-    "appointment is purely temporary",
-]
-PENALTY_KEYWORDS = [
-    "penalty","liquidated damages","late fee","interest per",
-    "default interest","indemnify","indemnification","hold harmless",
-]
+# ── Date normalisation ────────────────────────────────────────────────────────
+def normalize_date(date_str: str) -> str:
+    """Normalise any date string to DDMMYYYY (Solidity DATE_ constant key)."""
+    s = date_str.strip()
+    if re.match(r"^\d{8}$", s):
+        for fmt in ("%d%m%Y", "%Y%m%d"):
+            try: return dt.strptime(s, fmt).strftime("%d%m%Y")
+            except ValueError: pass
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{4}$", s):
+        try: return dt.strptime(s.replace("-","/"), "%d/%m/%Y").strftime("%d%m%Y")
+        except ValueError: pass
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        try: return dt.strptime(s, "%Y-%m-%d").strftime("%d%m%Y")
+        except ValueError: pass
+    for fmt in ("%d %B %Y","%d %b %Y","%B %d, %Y","%b %d, %Y","%B %d %Y","%b %d %Y"):
+        try: return dt.strptime(s, fmt).strftime("%d%m%Y")
+        except ValueError: pass
+    return s
 
-# ── spaCy NER ─────────────────────────────────────────────────────────────────
-
+# ── spaCy entity extraction ───────────────────────────────────────────────────
 def extract_entities_spacy(text: str) -> list:
-    nlp = get_nlp()
-    doc = nlp(text[:80000])
-    # CARDINAL intentionally removed — grabs phone/roll/CGPA numbers
-    LABEL_MAP = {
-        "PERSON": "PARTY",
-        "ORG":    "PARTY",
-        "GPE":    "PARTY",
-        "DATE":   "DATE_DEADLINE",
-        "TIME":   "DATE_DEADLINE",
-        "MONEY":  "PAYMENT",
-        "LAW":    "CONFIDENTIALITY_IP",
-    }
+    nlp = get_nlp(); doc = nlp(text[:80000])
+    LABEL_MAP = {"PERSON":"PARTY","ORG":"PARTY","GPE":"PARTY",
+                 "DATE":"DATE_DEADLINE","TIME":"DATE_DEADLINE",
+                 "MONEY":"PAYMENT","LAW":"CONFIDENTIALITY_IP"}
     entities, seen = [], set()
     for ent in doc.ents:
         mapped = LABEL_MAP.get(ent.label_)
-        if not mapped:
-            continue
+        if not mapped: continue
         val = ent.text.strip()
-        if not _is_valid_entity(val, mapped):
-            continue
-        if len(val) > 60:
-            continue
-        # Skip sentence-fragment entities
-        if re.search(r"\b(?:shall|must|will|if|unless|because|therefore)\b", val, re.I):
-            continue
+        if not _is_valid_entity(val, mapped): continue
+        if len(val) > 60: continue
+        if re.search(r"\b(?:shall|must|will|if|unless|because|therefore)\b", val, re.I): continue
         key = (mapped, val.lower()[:50])
         if key not in seen:
-            seen.add(key)
-            entities.append({"type": mapped, "value": val})
+            seen.add(key); entities.append({"type": mapped, "value": val})
     return entities
-
-# ── Atomic pattern extraction ──────────────────────────────────────────────────
 
 def extract_entities_atomic(text: str) -> list:
     entities, seen = [], set()
-
     def add(etype, raw):
         val = re.sub(r"\s+", " ", raw).strip()[:50]
-        if not _is_valid_entity(val, etype):
-            return
+        if not _is_valid_entity(val, etype): return
         key = (etype, val.lower()[:40])
         if key not in seen:
-            seen.add(key)
-            entities.append({"type": etype, "value": val})
-
+            seen.add(key); entities.append({"type": etype, "value": val})
     for pat in PARTY_PATTERNS:
         for m in re.finditer(pat, text, re.IGNORECASE):
             add("PARTY", m.group(1) if m.lastindex else m.group())
-
     for pat in PAYMENT_PATTERNS:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            add("PAYMENT", m.group())
-
+        for m in re.finditer(pat, text, re.IGNORECASE): add("PAYMENT", m.group())
     for pat in DATE_PATTERNS:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            add("DATE_DEADLINE", m.group())
-
-    for etype, patterns in [
-        ("DISPUTE_ARBITRATION",  DISPUTE_PATTERNS),
-        ("CONFIDENTIALITY_IP",   CONFIDENTIAL_PATTERNS),
-        ("FORCE_MAJEURE",        FORCE_MAJEURE_PATTERNS),
-        ("MILESTONE",            MILESTONE_PATTERNS),
-    ]:
-        for pat in patterns:
-            for m in re.finditer(pat, text, re.IGNORECASE):
-                add(etype, m.group())
-
+        for m in re.finditer(pat, text, re.IGNORECASE): add("DATE_DEADLINE", m.group())
+    for etype, pats in [("DISPUTE_ARBITRATION", DISPUTE_PATTERNS),
+                        ("CONFIDENTIALITY_IP",  CONFIDENTIAL_PATTERNS),
+                        ("FORCE_MAJEURE",       FORCE_MAJEURE_PATTERNS),
+                        ("MILESTONE",           MILESTONE_PATTERNS)]:
+        for pat in pats:
+            for m in re.finditer(pat, text, re.IGNORECASE): add(etype, m.group())
     return entities
 
-# ── Keyword clause entities ────────────────────────────────────────────────────
-
 def extract_clause_entities(text: str) -> list:
-    """One canonical keyword node per matched legal keyword in a sentence."""
-    nlp    = get_nlp()
-    doc    = nlp(text[:60000])
-    kw_map = [
-        ("OBLIGATION",     OBLIGATION_KEYWORDS),
-        ("CONDITION",      CONDITION_KEYWORDS),
-        ("TERMINATION",    TERMINATION_KEYWORDS),
-        ("PENALTY_REMEDY", PENALTY_KEYWORDS),
-    ]
+    nlp = get_nlp(); doc = nlp(text[:60000])
+    kw_map = [("OBLIGATION",OBLIGATION_KEYWORDS),("CONDITION",CONDITION_KEYWORDS),
+              ("TERMINATION",TERMINATION_KEYWORDS),("PENALTY_REMEDY",PENALTY_KEYWORDS)]
     entities, seen = [], set()
     for sent in doc.sents:
         s = sent.text.lower()
-        for etype, keywords in kw_map:
-            for kw in keywords:
+        for etype, kws in kw_map:
+            for kw in kws:
                 if kw in s:
                     key = (etype, kw)
                     if key not in seen:
-                        seen.add(key)
-                        entities.append({"type": etype, "value": kw})
+                        seen.add(key); entities.append({"type": etype, "value": kw})
     return entities
 
-# ── Semantic edge extraction ───────────────────────────────────────────────────
-
+# ── Semantic edge extraction ──────────────────────────────────────────────────
 SEMANTIC_VERB_MAP = {
-    "pay":       "PAYS",         "receive":   "RECEIVES",
-    "report":    "REPORTS_TO",   "provide":   "PROVIDES",
-    "deliver":   "DELIVERS",     "terminate": "TERMINATES",
-    "assign":    "ASSIGNS",      "complete":  "COMPLETES",
-    "fulfill":   "FULFILLS",     "submit":    "SUBMITS",
-    "notify":    "NOTIFIES",     "appoint":   "APPOINTS",
-    "engage":    "ENGAGES",      "employ":    "EMPLOYS",
-    "sign":      "SIGNS",        "cancel":    "CANCELS",
-    "breach":    "BREACHES",     "penalize":  "PENALIZES",
-    "join":      "JOINS",        "work":      "WORKS_FOR",
-    "conduct":   "CONDUCTS",     "carry":     "CARRIES_OUT",
-    "supervise": "SUPERVISES",   "guide":     "GUIDES",
-    "apply":     "APPLIES",      "allow":     "ALLOWS",
-    "require":   "REQUIRES",     "enter":     "ENTERS",
+    "pay":"PAYS","receive":"RECEIVES","report":"REPORTS_TO","provide":"PROVIDES",
+    "deliver":"DELIVERS","terminate":"TERMINATES","assign":"ASSIGNS","complete":"COMPLETES",
+    "fulfill":"FULFILLS","submit":"SUBMITS","notify":"NOTIFIES","appoint":"APPOINTS",
+    "engage":"ENGAGES","employ":"EMPLOYS","sign":"SIGNS","cancel":"CANCELS",
+    "breach":"BREACHES","penalize":"PENALIZES","join":"JOINS","work":"WORKS_FOR",
+    "supervise":"SUPERVISES","guide":"GUIDES","apply":"APPLIES","require":"REQUIRES",
 }
 
 def _build_node_index(G: nx.DiGraph) -> dict:
-    """
-    Build lookup: norm(label) -> node_id.
-    Also adds partial-word entries for fuzzy lookup.
-    """
     idx = {}
     for n in G.nodes:
-        label  = G.nodes[n].get("label", n)
+        label = G.nodes[n].get("label", n)
         normed = re.sub(r"[^a-z0-9]", "", label.lower())
         idx[normed] = n
-        # Also index individual words (len >= 4) from multi-word labels
         for word in re.findall(r"[a-z]{4,}", label.lower()):
-            if word not in idx:
-                idx[word] = n
+            if word not in idx: idx[word] = n
     return idx
 
-def _fuzzy_node_lookup(phrase: str, node_idx: dict) -> str | None:
-    """
-    Multi-tier fuzzy lookup:
-      1. Exact normalised match
-      2. Any significant word (len>=4) from phrase is in index
-      3. Phrase is prefix of an index key or vice-versa
-    """
-    if not phrase or len(phrase) < 2:
-        return None
+def _fuzzy_node_lookup(phrase: str, node_idx: dict):
+    if not phrase or len(phrase) < 2: return None
     normed = re.sub(r"[^a-z0-9]", "", phrase.lower())
-
-    # Tier 1: exact
-    if normed in node_idx:
-        return node_idx[normed]
-
-    # Tier 2: word-level match
-    words = re.findall(r"[a-z]{4,}", phrase.lower())
-    for w in words:
-        if w in node_idx:
-            return node_idx[w]
-
-    # Tier 3: prefix
+    if normed in node_idx: return node_idx[normed]
+    for w in re.findall(r"[a-z]{4,}", phrase.lower()):
+        if w in node_idx: return node_idx[w]
     for key in node_idx:
         if len(normed) >= 4 and (normed.startswith(key) or key.startswith(normed)):
             return node_idx[key]
-
     return None
 
 def extract_semantic_edges(text: str, G: nx.DiGraph):
-    """Extract semantic edges via verb-based dependency parsing only."""
-    nlp      = get_nlp()
-    node_idx = _build_node_index(G)
-
+    nlp = get_nlp(); node_idx = _build_node_index(G)
     for sent in nlp(text[:40000]).sents:
         tokens = list(sent)
-        subjs  = [t for t in tokens if t.dep_ in ("nsubj", "nsubjpass")]
-        objs   = [t for t in tokens if t.dep_ in ("dobj", "pobj", "attr")]
+        subjs  = [t for t in tokens if t.dep_ in ("nsubj","nsubjpass")]
+        objs   = [t for t in tokens if t.dep_ in ("dobj","pobj","attr")]
         verbs  = [t for t in tokens if t.pos_ == "VERB"]
-
         for subj in subjs:
             subj_phrase = " ".join(t.text for t in subj.subtree
-                                   if t.pos_ in ("NOUN", "PROPN", "ADJ") or t == subj)
+                                   if t.pos_ in ("NOUN","PROPN","ADJ") or t == subj)
             src = _fuzzy_node_lookup(subj_phrase, node_idx) or _fuzzy_node_lookup(subj.text, node_idx)
-            if not src:
-                continue
-
+            if not src: continue
             verb = min(verbs, key=lambda v: abs(v.i - subj.i), default=None)
-            if not verb:
-                continue
-            
+            if not verb: continue
             lemma = verb.lemma_.lower()
             neg = any(c.dep_ == "neg" for c in verb.children)
             sem_label = SEMANTIC_VERB_MAP.get(lemma)
-            if not sem_label:
-                continue
-            if neg:
-                sem_label = "NOT_" + sem_label
-
+            if not sem_label: continue
+            if neg: sem_label = "NOT_" + sem_label
             for obj in objs:
                 obj_phrase = " ".join(t.text for t in obj.subtree
-                                     if t.pos_ in ("NOUN", "PROPN", "ADJ") or t == obj)
+                                      if t.pos_ in ("NOUN","PROPN","ADJ") or t == obj)
                 tgt = _fuzzy_node_lookup(obj_phrase, node_idx) or _fuzzy_node_lookup(obj.text, node_idx)
                 if tgt and src != tgt and not G.has_edge(src, tgt):
                     G.add_edge(src, tgt, relation=sem_label)
 
-# ── Obligation → Party linking ─────────────────────────────────────────────────
-
+# ── Obligation → Party linking ────────────────────────────────────────────────
 def _link_obligations_to_parties(text: str, G: nx.DiGraph):
-    """Link obligations/conditions to parties and payments to parties."""
-    party_nodes  = [n for n in G.nodes if G.nodes[n].get("entity_type") == "PARTY"]
+    party_nodes   = [n for n in G.nodes if G.nodes[n].get("entity_type") == "PARTY"]
     payment_nodes = [n for n in G.nodes if G.nodes[n].get("entity_type") == "PAYMENT"]
-    target_types = {"OBLIGATION", "CONDITION", "TERMINATION"}
-    target_nodes = [n for n in G.nodes if G.nodes[n].get("entity_type") in target_types]
-
+    target_nodes  = [n for n in G.nodes
+                     if G.nodes[n].get("entity_type") in {"OBLIGATION","CONDITION","TERMINATION"}]
     sentences = re.split(r"[.;\n]", text)
-    
-    # OBLIGATION/CONDITION/TERMINATION → PARTY edges
+
     for kw_node in target_nodes:
-        kw = kw_node.lower()
-        counts: dict = {}
+        kw = kw_node.lower(); counts = {}
         for sent in sentences:
-            sent_lower = sent.lower()
-            if kw not in sent_lower:
-                continue
+            sl = sent.lower()
+            if kw not in sl: continue
             for p in party_nodes:
                 plabel = G.nodes[p].get("label", p).lower()
-                words = re.findall(r"[a-z]{4,}", plabel)
-                hit = plabel in sent_lower or plabel[:5] in sent_lower or any(w in sent_lower for w in words)
-                if hit:
+                words  = re.findall(r"[a-z]{4,}", plabel)
+                if plabel in sl or plabel[:5] in sl or any(w in sl for w in words):
                     counts[p] = counts.get(p, 0) + 1
         if counts:
             best = max(counts, key=counts.get)
             if not G.has_edge(best, kw_node):
                 G.add_edge(best, kw_node, relation="HAS_OBLIGATION")
 
-    # PAYMENT → PARTY edges
     for pay_node in payment_nodes:
         for sent in sentences:
-            if not re.search(r"(?:stipend|salary|pay|receive|payment|rs\.|inr)", sent.lower()):
-                continue
+            if not re.search(r"(?:stipend|salary|pay|receive|payment|rs\.|inr)", sent.lower()): continue
             for p in party_nodes:
                 plabel = G.nodes[p].get("label", p).lower()
-                words = re.findall(r"[a-z]{4,}", plabel)
-                hit = plabel in sent.lower() or any(w in sent.lower() for w in words)
-                if hit and not G.has_edge(p, pay_node):
-                    G.add_edge(p, pay_node, relation="RECEIVES")
+                words  = re.findall(r"[a-z]{4,}", plabel)
+                if plabel in sent.lower() or any(w in sent.lower() for w in words):
+                    if not G.has_edge(p, pay_node):
+                        G.add_edge(p, pay_node, relation="RECEIVES")
 
-# ── Build KG ───────────────────────────────────────────────────────────────────
-
+# ── Build KG ──────────────────────────────────────────────────────────────────
 def build_econtract_knowledge_graph(raw_text: str) -> nx.DiGraph:
     text = preprocess_text(raw_text)
     lang = detect_language(text)
-    G    = nx.DiGraph()
-    G.graph["language"] = lang
+    G    = nx.DiGraph(); G.graph["language"] = lang
 
-    raw_ents = (
-        extract_entities_atomic(text) +
-        extract_entities_spacy(text)  +
-        extract_clause_entities(text)
-    )
+    raw_ents = (extract_entities_atomic(text) +
+                extract_entities_spacy(text)  +
+                extract_clause_entities(text))
 
-    # Deduplicate PAYMENT nodes by numeric value — same amount stated different ways
-    # e.g. rs10000permonth, 10000permonth, stipendofrs10000 all → one node
     def _dedup_payments(entities):
-        seen_amounts = {}
-        result = []
+        seen_amounts = {}; result = []
         for e in entities:
-            if e["type"] != "PAYMENT":
-                result.append(e)
-                continue
+            if e["type"] != "PAYMENT": result.append(e); continue
             m = re.search(r"\d[\d,]*", e["value"])
-            if not m:
-                result.append(e)
-                continue
-            amount_key = m.group().replace(",", "")
-            if amount_key not in seen_amounts:
-                seen_amounts[amount_key] = True
-                result.append(e)
-            # else: duplicate payment amount — skip silently
+            if not m: result.append(e); continue
+            key = m.group().replace(",","")
+            if key not in seen_amounts:
+                seen_amounts[key] = True; result.append(e)
         return result
 
-    all_ents = _dedup_payments(raw_ents)
-
-    for e in all_ents:
+    for e in _dedup_payments(raw_ents):
         val = e["value"].strip()
-        if not val:
-            continue
-        
-        # Normalize date values — canonical form is DDMMYYYY (matches Solidity DATE_ key)
+        if not val: continue
         if e["type"] == "DATE_DEADLINE":
-            normalized = normalize_date(val)  # returns DDMMYYYY or original
-            nid   = normalized[:60]
-            if re.search(r"\d+\s+(?:days?|months?|years?|weeks?)", val, re.I):
-                label = f"duration_{nid}"
-            else:
-                # label contains the DDMMYYYY key so Tier C finds it as substring
-                # of 'DATE_DDMMYYYY' in Solidity code
-                label = f"date_{normalized}"
+            normalized = normalize_date(val); nid = normalized[:60]
+            label = (f"duration_{nid}"
+                     if re.search(r"\d+\s+(?:days?|months?|years?|weeks?)", val, re.I)
+                     else f"date_{normalized}")
         else:
-            nid = val[:60]
-            label = nid
-        
+            nid = val[:60]; label = nid
         if not G.has_node(nid):
             G.add_node(nid, entity_type=e["type"], label=label, lang=lang)
 
@@ -882,12 +536,11 @@ def build_econtract_knowledge_graph(raw_text: str) -> nx.DiGraph:
 def graph_to_dict(G: nx.DiGraph) -> dict:
     return {
         "nodes": [{"id": n, **G.nodes[n]} for n in G.nodes],
-        "edges": [{"source": u, "target": v, **G.edges[u, v]} for u, v in G.edges],
-        "meta":  {"language": G.graph.get("language", "en")},
+        "edges": [{"source": u, "target": v, **G.edges[u,v]} for u, v in G.edges],
+        "meta":  {"language": G.graph.get("language","en")},
     }
 
-# ── Visualisation ──────────────────────────────────────────────────────────────
-
+# ── Visualisation ─────────────────────────────────────────────────────────────
 TYPE_COLORS = {
     "PARTY":"#38bdf8","OBLIGATION":"#fb923c","DATE_DEADLINE":"#4ade80",
     "PAYMENT":"#facc15","CONDITION":"#c084fc","TERMINATION":"#f87171",
@@ -901,11 +554,9 @@ def render_graph_base64(G: nx.DiGraph, title: str = "Knowledge Graph") -> str:
         warnings.simplefilter("ignore")
         fig, ax = plt.subplots(figsize=(16, 10))
         ax.set_facecolor("#0f172a"); fig.patch.set_facecolor("#0f172a")
-
         if G.number_of_nodes() == 0:
-            ax.text(0.5, 0.5, "No entities extracted", ha="center", color="white",
-                    transform=ax.transAxes)
-            ax.axis("off")
+            ax.text(0.5, 0.5, "No entities extracted", ha="center",
+                    color="white", transform=ax.transAxes)
         else:
             color_map  = [TYPE_COLORS.get(G.nodes[n].get("entity_type","GENERIC"),"#64748b")
                           for n in G.nodes]
@@ -915,10 +566,8 @@ def render_graph_base64(G: nx.DiGraph, title: str = "Knowledge Graph") -> str:
                           for n in G.nodes]
             nx.draw_networkx_nodes(G, pos, node_color=color_map,
                                    node_size=node_sizes, alpha=0.92, ax=ax)
-            # ASCII-safe labels to suppress font warnings
             labels = {n: _ascii_label(G.nodes[n].get("label", n)) for n in G.nodes}
-            nx.draw_networkx_labels(G, pos, labels, font_size=6.5,
-                                    font_color="white", ax=ax)
+            nx.draw_networkx_labels(G, pos, labels, font_size=6.5, font_color="white", ax=ax)
             nx.draw_networkx_edges(G, pos, edge_color="#334155", arrows=True,
                                    arrowsize=12, connectionstyle="arc3,rad=0.08", ax=ax)
             el = {e: G.edges[e].get("relation","")[:16] for e in G.edges}
@@ -926,14 +575,12 @@ def render_graph_base64(G: nx.DiGraph, title: str = "Knowledge Graph") -> str:
                                          font_color="#94a3b8", ax=ax)
             legend = [mpatches.Patch(color=c, label=t) for t, c in TYPE_COLORS.items()]
             ax.legend(handles=legend, loc="upper left", fontsize=6.5,
-                      facecolor="#1e293b", labelcolor="white",
-                      framealpha=0.85, ncol=2)
-            lang = G.graph.get("language","en")
-            ax.set_title(f"{title}  [lang={lang}]", color="white", fontsize=13, pad=10)
-            ax.axis("off")
-
+                      facecolor="#1e293b", labelcolor="white", framealpha=0.85, ncol=2)
+            ax.set_title(f"{title}  [lang={G.graph.get('language','en')}]",
+                         color="white", fontsize=13, pad=10)
+        ax.axis("off")
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", bbox_inches="tight",
-                    dpi=120, facecolor=fig.get_facecolor())
+        plt.savefig(buf, format="png", bbox_inches="tight", dpi=120,
+                    facecolor=fig.get_facecolor())
         plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
