@@ -22,7 +22,7 @@ import networkx as nx
 import requests
 
 OLLAMA_URL     = "http://localhost:11434/api/generate"
-OLLAMA_MODEL   = "qwen2.5:7b"
+OLLAMA_MODEL   = "qwen2.5-coder-7b"
 MAX_ITERATIONS = 5
 
 # ── Normalisation helpers ─────────────────────────────────────────────────────
@@ -451,7 +451,7 @@ def _ollama_patch(prompt: str, temperature: float = 0.1) -> str:
         try:
             resp = requests.post(OLLAMA_URL, json={
                 "model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-                "options": {"temperature": temperature, "num_predict": 2048},
+                "options": {"temperature": 0.75, "num_predict": 2048},
             }, timeout=60)
             resp.raise_for_status()
             patch = _extract_patch_only(resp.json().get("response",""))

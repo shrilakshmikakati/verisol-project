@@ -74,14 +74,14 @@ Accuracy Score
     │
   ≥100%? ──YES──▶  Save .sol
     │NO
-    ▼  Algorithm 4 (Ollama qwen2.5:7b, max 5 iterations)
+    ▼  Algorithm 4 (Ollama qwen2.5-coder-7b, max 5 iterations)
 Refined Smart Contract ──▶ re-compare ──▶ Save .sol
 ```
 
 ## Prerequisites
 
 - Python 3.10+
-- Ollama running with qwen2.5:7b: `ollama pull qwen2.5:7b && ollama serve`
+- Ollama running with qwen2.5-coder-7b: `ollama pull qwen2.5-coder-7b && ollama serve`
 - Tesseract OCR (for image input): `sudo apt install tesseract-ocr`
 
 ## Project Structure

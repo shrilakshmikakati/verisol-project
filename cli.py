@@ -34,8 +34,8 @@ def print_step(icon, msg):
 
 BANNER = f"""
 {cyan('  ╔══════════════════════════════════════════════════════════════╗')}
-{cyan('  ║')}  {bold('ContractForge')} — E-Contract → Smart Contract CLI          {cyan('║')}
-{cyan('  ║')}  {dim('NLP · Knowledge Graph · Solidity 0.8.16 · qwen2.5:7b')}  {cyan('║')}
+{cyan('  ║')}  {bold('ContractForge')} — E-Contract → Smart Contract CLI  {cyan('║')}
+{cyan('  ║')}  {dim('NLP · Knowledge Graph · Solidity 0.8.16 · qwen2.5-coder-7b')}  {cyan('║')}
 {cyan('  ╚══════════════════════════════════════════════════════════════╝')}
 """
 
@@ -156,7 +156,7 @@ def run_pipeline(file_path, contract_name, output_dir, page_number=0, page_title
         "contract_name": contract_name, "source_file": str(file_path),
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00','Z'),
         "solidity_version": "0.8.16",
-        "pipeline": {"iterations_used": iters, "llm_model": "qwen2.5:7b"},
+        "pipeline": {"iterations_used": iters, "llm_model": "qwen2.5-coder-7b"},
         "initial_comparison": {k: init_cmp.get(k) for k in ("accuracy","node_similarity","edge_similarity","is_valid")},
         "final_comparison": {k: final_cmp.get(k) for k in ("accuracy","node_similarity","edge_similarity","is_valid","ec_node_count","sc_node_count")},
         "final_comparison_is_validated": final_cmp.get("is_valid", False),
@@ -219,16 +219,7 @@ def _run_refinement(initial_sol, text, G_e, refinement_loop_fn, pct, overall_fn)
             print_progress(f"Refinement {i}/{result[2]}...", overall_fn())
     return result[0], result[1], result[2]
 
-# ── Demo ───────────────────────────────────────────────────────────────────────
-DEMO = """SERVICE AGREEMENT\nThis Agreement is entered into as of January 15, 2025, between TechCorp Inc. ("Vendor") and ClientCo LLC ("Client").\n1. SERVICES\nVendor shall provide software development services. Delivery by March 31, 2025.\n2. PAYMENT\nClient shall pay Vendor $50,000 USD within 30 days of invoice. Late payments incur 1.5% penalty per month.\n3. TERMINATION\nEither party may terminate with 30 days written notice. Breach allows immediate termination.\n4. CONDITIONS\nServices commence provided Client has paid a deposit of $10,000. No subcontracting without consent.\n5. CONFIDENTIALITY\nBoth parties maintain confidentiality. Vendor assigns all IP to Client upon final payment.\n6. DISPUTE RESOLUTION\nDisputes resolved by ICC arbitration under English Law."""
 
-def cmd_demo(args):
-    print(BANNER); print(bold("  Demo Mode\n"))
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
-    tmp.write(DEMO); tmp.flush(); tmp.close()
-    run_pipeline(tmp.name, "ServiceAgreement", getattr(args,"output","./Results/demo"))
-    os.unlink(tmp.name)
 
 # ── Run single ─────────────────────────────────────────────────────────────────
 def cmd_run(args):
@@ -343,7 +334,7 @@ def main():
     d = sub.add_parser("demo"); d.add_argument("--output", default="./Results/demo")
     sub.add_parser("check")
     args = parser.parse_args()
-    {"run": cmd_run, "run-multi": cmd_run_multi, "demo": cmd_demo, "check": cmd_check}.get(
+    {"run": cmd_run, "run-multi": cmd_run_multi}.get(
         args.cmd, lambda _: parser.print_help())(args)
 
 if __name__ == "__main__":
