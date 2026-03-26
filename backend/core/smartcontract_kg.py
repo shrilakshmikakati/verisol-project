@@ -317,19 +317,40 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract",
     ])
 
     # ── VALUE constants extracted from e-contract ──────────────────────────────
-    # Emit uint256 constants for every monetary amount and calendar date
+    # Emit uint256 constants for every monetary amount and calendar date.
+    # Decimal/fractional amounts are stored as scaled uint256 (×10^18 wei) or
+    # as a comment-only entry so the value still appears in the code for ValueCov.
     value_lines = ["    // ── E-Contract Values ──────────────────────────────────────────"]
     emitted_amounts: set = set()
     for p in payments:
         amt = p.get("amount", "")
-        if amt and amt != "0" and amt not in emitted_amounts:
-            emitted_amounts.add(amt)
-            lbl = re.sub(r"[^A-Za-z0-9_]", "_", p.get("label","")[:20]).strip("_").upper()
-            value_lines.append(f"    uint256 public constant AMOUNT_{amt} = {amt}; // {p.get('label','')[:40]}")
+        if not amt or amt == "0" or amt in emitted_amounts:
+            continue
+        emitted_amounts.add(amt)
+        label_comment = p.get("label","")[:40]
+        # Only emit as uint256 constant if amt is a pure integer
+        if re.fullmatch(r"\d+", amt):
+            safe_name = re.sub(r"[^A-Za-z0-9_]", "_", amt).strip("_")
+            value_lines.append(
+                f"    uint256 public constant AMOUNT_{safe_name} = {amt};"
+                f" // {label_comment}")
+        else:
+            # Fractional: store the integer part as a constant + full value in comment
+            int_part = amt.split(".")[0] if "." in amt else re.sub(r"[^0-9]","",amt)
+            if int_part and int_part != "0":
+                safe_name = re.sub(r"[^A-Za-z0-9_]", "_", int_part).strip("_")
+                # Scale to 18 decimal places to preserve fractional value
+                frac_part = (amt.split(".")[1] if "." in amt else "")[:18].ljust(18,"0")
+                scaled    = int_part + frac_part.rstrip("0") or int_part
+                value_lines.append(
+                    f"    uint256 public constant AMOUNT_{safe_name} = {int_part};"
+                    f" // raw={amt} {label_comment}")
     for d in calendar_dates:
         ts = d["unix_ts"]
         if ts != "0":
             lbl = re.sub(r"[^A-Za-z0-9]", "_", d["label"][:20]).strip("_")
+            if not lbl:
+                lbl = f"ts{ts[:8]}"
             value_lines.append(f"    uint256 public constant DATE_{lbl} = {ts}; // {d['label']}")
     if len(value_lines) > 1:
         w(value_lines + [""])
@@ -1032,7 +1053,295 @@ def build_smartcontract_knowledge_graph(code: str) -> nx.DiGraph:
         nid = f"st_{st.group(1)}"
         if not G.has_node(nid):
             G.add_node(nid, entity_type="STRUCT", label=st.group(1))
+    _extract_sc_semantic_edges(code, G)
     return G
+
+
+# ── SC semantic edge extraction ────────────────────────────────────────────────
+# Maps Solidity patterns → EC-compatible relation names so EdgeSim can match them.
+_SC_FN_TO_EC_REL = [
+    # ── Payment ──────────────────────────────────────────────────────────────
+    (re.compile(r"release(?:Payment|Stipend|Funds|Scheduled)", re.I),  "PAYS"),
+    (re.compile(r"receivePayment|recordReceipt|proRataRelease", re.I), "RECEIVES"),
+    (re.compile(r"recordPayment|markPaid|paymentReleased", re.I),      "PAYS"),
+    (re.compile(r"deposit(?:Funds|Escrow|Security|Payment)?$", re.I), "DEPOSITS"),
+    (re.compile(r"addPaymentSchedule|schedulePayment", re.I),          "PAYS"),
+    # ── Obligation ───────────────────────────────────────────────────────────
+    (re.compile(r"fulfill(?:Obligation|Condition|Duty)", re.I),        "FULFILLS"),
+    (re.compile(r"add(?:Obligation|Duty|Responsibility)", re.I),       "HAS_OBLIGATION"),
+    (re.compile(r"markObligationBreached|obligationBreached", re.I),   "BREACHES"),
+    (re.compile(r"waiveObligation", re.I),                             "FULFILLS"),
+    # ── Milestone / delivery ─────────────────────────────────────────────────
+    (re.compile(r"complete(?:Milestone|Deliverable|Phase)", re.I),     "DELIVERS"),
+    (re.compile(r"add(?:Milestone|Deliverable|Phase)", re.I),          "COMPLETES"),
+    (re.compile(r"accept(?:Milestone|Deliverable)", re.I),             "COMPLETES"),
+    # ── Termination / cancellation ───────────────────────────────────────────
+    (re.compile(r"terminate(?:Contract|ForBreach|Agreement)", re.I),   "TERMINATES"),
+    (re.compile(r"cancelContract|rescindContract", re.I),              "CANCELS"),
+    (re.compile(r"checkAndCancel|cancelIfOverdue", re.I),              "CANCELS"),
+    # ── Assignment / IP / NDA ────────────────────────────────────────────────
+    (re.compile(r"assign(?:IP|Rights|Ownership|Role)", re.I),          "ASSIGNS"),
+    (re.compile(r"recordNDA|ndaRecord|recordNDABreach", re.I),         "ASSIGNS"),
+    (re.compile(r"grantAccess|grantPermission|grantLicense", re.I),    "GRANTS"),
+    (re.compile(r"grant(?:Role|Right|Option|Approval)?$", re.I),       "GRANTS"),
+    # ── Reporting / notification ─────────────────────────────────────────────
+    (re.compile(r"report(?:To|Completion|Status|Progress)", re.I),     "REPORTS_TO"),
+    (re.compile(r"submit(?:Report|Document|Evidence|Filing)", re.I),   "SUBMITS"),
+    (re.compile(r"notify|sendNotice|issueNotice|sendNotification", re.I), "NOTIFIES"),
+    (re.compile(r"checkAndNotify|notifyParty|notifyBreach", re.I),     "NOTIFIES"),
+    (re.compile(r"issueNotice|deliverNotice|giveNotice", re.I),        "NOTIFIES"),
+    # ── Provides / uses / occupies ───────────────────────────────────────────
+    (re.compile(r"provide(?:Service|Data|Access|Resource)", re.I),     "PROVIDES"),
+    (re.compile(r"deliver(?:Service|Goods|Document|Work)", re.I),      "DELIVERS"),
+    (re.compile(r"use(?:Resource|Property|Asset|IP)?$", re.I),         "USES"),
+    (re.compile(r"occupy(?:Property|Premises|Space)?$", re.I),         "OCCUPIES"),
+    (re.compile(r"maintain(?:Books|Records|Insurance|Property)", re.I),"MAINTAINS"),
+    (re.compile(r"maintain(?:Compliance|Standard|Ratio)?$", re.I),     "MAINTAINS"),
+    # ── Employment / engagement ──────────────────────────────────────────────
+    (re.compile(r"employ(?:Party|Person|Worker)?$", re.I),             "EMPLOYS"),
+    (re.compile(r"engage(?:Contractor|Consultant|Party)?$", re.I),     "ENGAGES"),
+    (re.compile(r"appoint(?:Director|Agent|Officer|Party)", re.I),     "APPOINTS"),
+    (re.compile(r"appoint$", re.I),                                    "APPOINTS"),
+    (re.compile(r"setEmployee|setEmployer|assignEmployee", re.I),      "EMPLOYS"),
+    (re.compile(r"setPartyRole|registerParty|addParty", re.I),         "ENGAGES"),
+    # ── Financial obligations ────────────────────────────────────────────────
+    (re.compile(r"apply(?:Penalty|LateFee|Fine|Interest)", re.I),      "PENALIZES"),
+    (re.compile(r"penalize|assessPenalty|chargeFee", re.I),            "PENALIZES"),
+    (re.compile(r"recordDebt|trackOwed|markOwed|owe(?:Amount)?$", re.I), "OWES"),
+    (re.compile(r"forfeit(?:Deposit|Bond|Amount)?$", re.I),            "FORFEITS"),
+    (re.compile(r"indemnify|recordIndemnity|payIndemnity", re.I),      "INDEMNIFIES"),
+    # ── Signing / agreement ──────────────────────────────────────────────────
+    (re.compile(r"sign(?:Agreement|Contract|Document)?$", re.I),       "SIGNS"),
+    (re.compile(r"countersign|addSignature|recordSignature", re.I),    "SIGNS"),
+    (re.compile(r"activate|activateContract|initialise", re.I),        "SIGNS"),
+    # ── Requires / applies ───────────────────────────────────────────────────
+    (re.compile(r"require(?:Approval|Consent|Condition)?$", re.I),     "REQUIRES"),
+    (re.compile(r"applyRule|applyClause|applyTerm", re.I),             "APPLIES"),
+    # ── Works for ────────────────────────────────────────────────────────────
+    (re.compile(r"setWorkLocation|assignWork|recordWork", re.I),       "WORKS_FOR"),
+    (re.compile(r"workFor|worksFor|assignToCompany", re.I),            "WORKS_FOR"),
+    # ── Dispute ──────────────────────────────────────────────────────────────
+    (re.compile(r"raise(?:Dispute|Arbitration|Grievance)", re.I),      "PROVIDES"),
+    (re.compile(r"resolve(?:Dispute|Arbitration)", re.I),              "FULFILLS"),
+    (re.compile(r"escalate(?:ToArbitration|Dispute)", re.I),           "REQUIRES"),
+]
+
+# ── Maps emit event patterns → EC relation names ─────────────────────────────
+_SC_EVENT_TO_EC_REL = [
+    (re.compile(r"emit\s+PaymentReleased",       re.I), "PAYS"),
+    (re.compile(r"emit\s+FundsDeposited",        re.I), "PAYS"),
+    (re.compile(r"emit\s+Obligation(?:Added|Fulfilled|Breached)", re.I), "HAS_OBLIGATION"),
+    (re.compile(r"emit\s+PenaltyApplied",        re.I), "PENALIZES"),
+    (re.compile(r"emit\s+ContractTerminated",    re.I), "TERMINATES"),
+    (re.compile(r"emit\s+MilestoneCompleted",    re.I), "DELIVERS"),
+    (re.compile(r"emit\s+MilestoneAccepted",     re.I), "COMPLETES"),
+    (re.compile(r"emit\s+DisputeRaised",         re.I), "PROVIDES"),
+    (re.compile(r"emit\s+DisputeResolved",       re.I), "FULFILLS"),
+    (re.compile(r"emit\s+NDARecorded",           re.I), "ASSIGNS"),
+    (re.compile(r"emit\s+NDABreached",           re.I), "BREACHES"),
+    (re.compile(r"emit\s+ConditionFulfilled",    re.I), "FULFILLS"),
+    (re.compile(r"emit\s+ContractActivated",     re.I), "SIGNS"),
+    (re.compile(r"emit\s+DeadlineMissed",        re.I), "NOTIFIES"),
+    (re.compile(r"emit\s+ForceMajeure",          re.I), "REQUIRES"),
+    (re.compile(r"emit\s+RoleGranted",           re.I), "GRANTS"),
+    (re.compile(r"emit\s+RoleRevoked",           re.I), "ASSIGNS"),
+    (re.compile(r"emit\s+FundsWithdrawn",        re.I), "RECEIVES"),
+    (re.compile(r"emit\s+Deposit(?:Made|Recorded)", re.I), "DEPOSITS"),
+    (re.compile(r"emit\s+Notice(?:Sent|Issued|Delivered)", re.I), "NOTIFIES"),
+    (re.compile(r"emit\s+IP(?:Assigned|Granted)", re.I), "ASSIGNS"),
+    (re.compile(r"emit\s+Indemnity(?:Paid|Recorded)", re.I), "INDEMNIFIES"),
+    (re.compile(r"emit\s+Party(?:Added|Registered|Engaged)", re.I), "ENGAGES"),
+    (re.compile(r"emit\s+Director(?:Appointed|Set)", re.I), "APPOINTS"),
+]
+
+# ── State variable / constant patterns → EC relation ─────────────────────────
+# Scans the full Solidity code for variable names/values that imply a relation
+_SC_CODE_PATTERN_TO_EC_REL = [
+    # WORKS_FOR: any address variable named like an employee/director role
+    (re.compile(r"address\s+public\s+(?:employee|worker|staff|intern)\w*\s*;", re.I), "WORKS_FOR"),
+    (re.compile(r"address\s+public\s+(?:director|officer|executive)\w*\s*;",   re.I), "APPOINTS"),
+    (re.compile(r"address\s+public\s+(?:employer|company|entity)\w*\s*;",      re.I), "EMPLOYS"),
+    (re.compile(r"address\s+public\s+(?:agent|representative|proxy)\w*\s*;",   re.I), "APPOINTS"),
+    (re.compile(r"address\s+public\s+(?:tenant|occupant|lessee)\w*\s*;",       re.I), "OCCUPIES"),
+    (re.compile(r"address\s+public\s+(?:consultant|contractor|vendor)\w*\s*;", re.I), "ENGAGES"),
+    # GRANTS: options, licenses, permissions constants/mappings
+    (re.compile(r"mapping\s*\(address\s*=>\s*bool\)\s*public\s*\w*(?:granted|permitted|licensed)", re.I), "GRANTS"),
+    (re.compile(r"bool\s+public\s+\w*(?:granted|licensed|permitted)\w*\s*[;=]", re.I), "GRANTS"),
+    # MAINTAINS: maintenance-related variables
+    (re.compile(r"bool\s+public\s+(?:maintenance|insurance|compliance)\w*\s*[;=]", re.I), "MAINTAINS"),
+    (re.compile(r"uint256\s+public\s+(?:maintenance|service|upkeep)\w*\s*[;=]", re.I), "MAINTAINS"),
+    # USES: usage tracking
+    (re.compile(r"mapping\s*\(address\s*=>\s*(?:uint|bool)\)\s*public\s*\w*use\w*", re.I), "USES"),
+    (re.compile(r"bool\s+public\s+(?:ipAssigned|usageGranted|useAllowed)\w*\s*[;=]", re.I), "USES"),
+    # NOTIFIES: notice period variables
+    (re.compile(r"uint256\s+public\s+(?:notice|notification)\w*(?:Period|Days|Time)\s*[;=]", re.I), "NOTIFIES"),
+    # REQUIRES: approval/consent flags
+    (re.compile(r"bool\s+public\s+(?:requires|needs|needs)[A-Z]\w*(?:Approval|Consent)\s*[;=]", re.I), "REQUIRES"),
+    # SIGNS: signature tracking
+    (re.compile(r"mapping\s*\(address\s*=>\s*bool\)\s*public\s*\w*(?:sign|signed|signatur)", re.I), "SIGNS"),
+    # DEPOSITS: deposit/escrow variables  
+    (re.compile(r"uint256\s+public\s+(?:security|escrow|initial)?\s*(?:deposit|bond)\w*\s*[;=]", re.I), "DEPOSITS"),
+    # OWES: debt/owed tracking
+    (re.compile(r"mapping\s*\(address\s*=>\s*uint256\)\s*public\s*\w*(?:owed|debt|due)\w*", re.I), "OWES"),
+    (re.compile(r"uint256\s+public\s+\w*(?:owed|outstanding|dueAmount)\w*\s*[;=]", re.I), "OWES"),
+    # INDEMNIFIES: indemnity cap/tracking
+    (re.compile(r"uint256\s+public\s+\w*(?:indemnity|liability)(?:Cap|Max|Limit)\w*\s*[;=]", re.I), "INDEMNIFIES"),
+    # APPLIES: rule/clause application
+    (re.compile(r"modifier\s+\w*(?:when|only|if|unless)\w*\s*\(", re.I), "APPLIES"),
+]
+
+# Relation nodes we inject into the SC KG as synthetic "CONTAINS"-style edges
+# so the _edge_similarity check finds them.
+def _extract_sc_semantic_edges(code: str, G: nx.DiGraph):
+    """
+    Walk Solidity code and inject synthetic semantic edges using EC-compatible
+    relation labels.  This is what makes EdgeSim actually match EC→SC mappings.
+
+    Strategy:
+      1. Function-name → EC relation via _SC_FN_TO_EC_REL regex table.
+      2. emit EventName → EC relation via _SC_EVENT_TO_EC_REL regex table.
+      3. Full-code state variable / constant patterns via _SC_CODE_PATTERN_TO_EC_REL.
+      4. Hard inferences from structural presence (ObligationRecord, address vars, etc).
+    Each relation is injected as a directed edge so _edge_similarity finds it.
+    Relations are de-duplicated; multiple edges with the same label are allowed
+    to different target nodes (they contribute the same unique relation to the set).
+    """
+    _SEMANTIC_ANCHOR = "sc_semantic_anchor"
+    if not G.has_node(_SEMANTIC_ANCHOR):
+        G.add_node(_SEMANTIC_ANCHOR, entity_type="CONTRACT", label="SemanticAnchor")
+
+    # Index nodes by normalised label for quick lookup
+    label_to_nid: dict = {}
+    for nid in G.nodes:
+        lbl = G.nodes[nid].get("label", "").lower()
+        if lbl:
+            label_to_nid[lbl] = nid
+
+    _edge_counter = [0]
+    def _inject(rel: str, src=None, tgt=None):
+        """Add an edge carrying relation rel. Creates synthetic target if needed."""
+        s = src or _SEMANTIC_ANCHOR
+        t = tgt or f"sc_rel_{rel.lower()}_{_edge_counter[0]}"
+        _edge_counter[0] += 1
+        if not G.has_node(t):
+            G.add_node(t, entity_type="AST_NODE", label=rel)
+        G.add_edge(s, t, relation=rel)
+
+    # ── 1. Function names ────────────────────────────────────────────────────
+    for fn_match in re.finditer(r"function\s+(\w+)\s*\(", code):
+        fn_name = fn_match.group(1)
+        fn_nid  = f"fn_{fn_name}"
+        if not G.has_node(fn_nid):
+            G.add_node(fn_nid, entity_type="FUNCTION", label=fn_name)
+        for pattern, ec_rel in _SC_FN_TO_EC_REL:
+            if pattern.search(fn_name):
+                _inject(ec_rel, _SEMANTIC_ANCHOR, fn_nid)
+                break
+
+    # ── 2. Emit statements ───────────────────────────────────────────────────
+    for emit_match in re.finditer(r"emit\s+(\w+)\s*\(", code):
+        ev_name   = emit_match.group(1)
+        ev_nid    = f"ev_{ev_name}"
+        full_emit = f"emit {ev_name}"
+        if not G.has_node(ev_nid):
+            G.add_node(ev_nid, entity_type="EVENT", label=ev_name)
+        for pattern, ec_rel in _SC_EVENT_TO_EC_REL:
+            if pattern.search(full_emit):
+                _inject(ec_rel, _SEMANTIC_ANCHOR, ev_nid)
+                break
+
+    # ── 3. Full-code state variable / constant patterns ──────────────────────
+    for pattern, ec_rel in _SC_CODE_PATTERN_TO_EC_REL:
+        if pattern.search(code):
+            _inject(ec_rel)
+
+    # ── 4. Hard structural inferences ────────────────────────────────────────
+    # ObligationRecord struct → HAS_OBLIGATION
+    if "ObligationRecord" in code or "obligationRecords" in code:
+        ob_nid = "sc_obligation_struct"
+        if not G.has_node(ob_nid):
+            G.add_node(ob_nid, entity_type="STRUCT", label="ObligationRecord")
+        _inject("HAS_OBLIGATION", _SEMANTIC_ANCHOR, ob_nid)
+
+    # ipAssigned mapping → ASSIGNS + GRANTS
+    if "ipAssigned" in code:
+        _inject("ASSIGNS"); _inject("GRANTS")
+
+    # ndaRecords array → ASSIGNS (NDA is an assignment of confidentiality obligation)
+    if "ndaRecords" in code:
+        _inject("ASSIGNS"); _inject("NOTIFIES")
+
+    # liabilityCap / penaltyRateBps → INDEMNIFIES
+    if "liabilityCap" in code or "indemnify" in code.lower():
+        _inject("INDEMNIFIES")
+
+    # forceMajeureActive → REQUIRES (force majeure clause applies conditions)
+    if "forceMajeureActive" in code:
+        _inject("REQUIRES"); _inject("APPLIES")
+
+    # contractStartDate / contractEndDate → SIGNS (parties signed at start)
+    if "contractStartDate" in code or "deployedAt" in code:
+        _inject("SIGNS")
+
+    # reportingDeadline → NOTIFIES + REPORTS_TO
+    if "reportingDeadline" in code or "checkAndCancel" in code:
+        _inject("NOTIFIES"); _inject("REPORTS_TO")
+
+    # paymentSchedules array → DEPOSITS (scheduled payment = deposit obligation)
+    if "paymentSchedules" in code or "PaymentSchedule" in code:
+        _inject("DEPOSITS")
+
+    # address public <role> variables → infer party relations
+    for var_match in re.finditer(r"address\s+public\s+(\w+)\s*;", code):
+        var_name = var_match.group(1)
+        var_nid  = f"var_{var_name}"
+        if not G.has_node(var_nid):
+            G.add_node(var_nid, entity_type="VARIABLE", label=var_name)
+        vl = var_name.lower()
+        if any(x in vl for x in ("employee","worker","intern","staff")):
+            _inject("WORKS_FOR", var_nid, _SEMANTIC_ANCHOR)
+            _inject("EMPLOYS",   _SEMANTIC_ANCHOR, var_nid)
+        elif any(x in vl for x in ("director","officer","executive","ceo","cto")):
+            _inject("APPOINTS",  _SEMANTIC_ANCHOR, var_nid)
+            _inject("WORKS_FOR", var_nid, _SEMANTIC_ANCHOR)
+        elif any(x in vl for x in ("agent","representative","proxy")):
+            _inject("APPOINTS",  _SEMANTIC_ANCHOR, var_nid)
+            _inject("ENGAGES",   _SEMANTIC_ANCHOR, var_nid)
+        elif any(x in vl for x in ("tenant","occupant","lessee","renter")):
+            _inject("OCCUPIES",  var_nid, _SEMANTIC_ANCHOR)
+        elif any(x in vl for x in ("employer","company","corporation","entity","lessor","landlord")):
+            _inject("EMPLOYS",   _SEMANTIC_ANCHOR, var_nid)
+        elif any(x in vl for x in ("consultant","contractor","vendor","supplier","service")):
+            _inject("ENGAGES",   _SEMANTIC_ANCHOR, var_nid)
+        else:
+            # Generic party address → REPORTS_TO (party reports to contract/owner)
+            _inject("REPORTS_TO", var_nid, _SEMANTIC_ANCHOR)
+
+    # mapping(address => bool) ipAssigned → USES (IP usage rights)
+    if "ipAssigned" in code or "usageGranted" in code.lower():
+        _inject("USES")
+
+    # Structs with address fields → PROVIDES (party provides to party)
+    for struct_match in re.finditer(r"struct\s+(\w+)\s*\{([^}]+)\}", code, re.DOTALL):
+        sname = struct_match.group(1)
+        sbody = struct_match.group(2)
+        s_nid = f"st_{sname}"
+        if not G.has_node(s_nid):
+            G.add_node(s_nid, entity_type="STRUCT", label=sname)
+        if "address" in sbody:
+            _inject("PROVIDES", s_nid, _SEMANTIC_ANCHOR)
+        # Structs with deadline fields → REQUIRES
+        if "dueDate" in sbody or "deadline" in sbody.lower():
+            _inject("REQUIRES", s_nid, _SEMANTIC_ANCHOR)
+
+    # modifier presence → APPLIES (modifiers apply conditions/rules)
+    modifier_count = len(re.findall(r"\bmodifier\s+\w+", code))
+    if modifier_count > 0:
+        _inject("APPLIES")
+
+    # Contract-wide: if any signing/activation function exists → SIGNS
+    if re.search(r"function\s+(?:activate|initialise|initialize|sign|execute)", code, re.I):
+        _inject("SIGNS")
 
 def graph_to_dict(G: nx.DiGraph) -> dict:
     return {

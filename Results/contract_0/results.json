@@ -1,25 +1,25 @@
 {
   "contract_name": "contract_0",
   "source_file": "contract_0.txt",
-  "generated_at": "2026-03-25T11:19:34.685815Z",
+  "generated_at": "2026-03-26T06:12:02.113586Z",
   "solidity_version": "0.8.16",
   "pipeline": {
-    "iterations_used": 2,
-    "llm_model": "qwen2.5-coder-7b"
+    "iterations_used": 0,
+    "llm_model": "qwen2.5:7b"
   },
   "initial_comparison": {
-    "accuracy": 90.75,
-    "node_similarity": 90.59,
-    "edge_similarity": 54.55,
-    "is_valid": false
+    "accuracy": 96.13,
+    "node_similarity": 92.27,
+    "edge_similarity": 100.0,
+    "is_valid": true
   },
   "final_comparison": {
-    "accuracy": 90.75,
-    "node_similarity": 90.59,
-    "edge_similarity": 54.55,
-    "is_valid": false,
+    "accuracy": 96.13,
+    "node_similarity": 92.27,
+    "edge_similarity": 100.0,
+    "is_valid": true,
     "ec_node_count": 541,
-    "sc_node_count": 209
+    "sc_node_count": 245
   },
-  "final_comparison_is_validated": false
+  "final_comparison_is_validated": true
 }

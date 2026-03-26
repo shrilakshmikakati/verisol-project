@@ -35,7 +35,7 @@ def print_step(icon, msg):
 BANNER = f"""
 {cyan('  ╔══════════════════════════════════════════════════════════════╗')}
 {cyan('  ║')}  {bold('ContractForge')} — E-Contract → Smart Contract CLI  {cyan('║')}
-{cyan('  ║')}  {dim('NLP · Knowledge Graph · Solidity 0.8.16 · qwen2.5-coder-7b')}  {cyan('║')}
+{cyan('  ║')}  {dim('NLP · Knowledge Graph · Solidity 0.8.16 · qwen2.5:7b')}  {cyan('║')}
 {cyan('  ╚══════════════════════════════════════════════════════════════╝')}
 """
 
@@ -156,7 +156,7 @@ def run_pipeline(file_path, contract_name, output_dir, page_number=0, page_title
         "contract_name": contract_name, "source_file": str(file_path),
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00','Z'),
         "solidity_version": "0.8.16",
-        "pipeline": {"iterations_used": iters, "llm_model": "qwen2.5-coder-7b"},
+        "pipeline": {"iterations_used": iters, "llm_model": "qwen2.5:7b"},
         "initial_comparison": {k: init_cmp.get(k) for k in ("accuracy","node_similarity","edge_similarity","is_valid")},
         "final_comparison": {k: final_cmp.get(k) for k in ("accuracy","node_similarity","edge_similarity","is_valid","ec_node_count","sc_node_count")},
         "final_comparison_is_validated": final_cmp.get("is_valid", False),

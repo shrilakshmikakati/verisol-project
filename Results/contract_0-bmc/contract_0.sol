@@ -1,12 +1,10 @@
+pragma solidity >=0.4.24;
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.16;
-
 /// @title  contract0
 /// @notice Auto-generated from E-Contract KG | Type: RENTAL
 /// @dev    Jurisdiction: California | Governing Law: Delaware Law
 ///         Arbitration:  Arbitration (Mutual Consent)
 contract contract0 {
-
     // ── Core ────────────────────────────────────────────────────────
     address public owner;
     bool    public isActive;
@@ -20,7 +18,6 @@ contract contract0 {
     string  public constant JURISDICTION   = "California";
     string  public constant GOVERNING_LAW  = "Delaware Law";
     string  public constant ARBITRATION    = "Arbitration (Mutual Consent)";
-
     // ── Parties ─────────────────────────────────────────────────────
     address public Employee; // Employee
     address public Director; // Director
@@ -31,7 +28,6 @@ contract contract0 {
     address public Agreement; // Agreement
     address public Parent; // Parent
     address public Company; // Company
-
     // ── Financial ───────────────────────────────────────────────────
     uint256 public totalContractValue;
     uint256 public paidAmount;
@@ -39,7 +35,6 @@ contract contract0 {
     uint256 public penaltyPeriod;     // seconds per penalty period
     uint256 public liabilityCap;      // max total penalty (0 = uncapped)
     uint256 public accruedPenalties;
-
     // ── E-Contract Values ──────────────────────────────────────────
     uint256 public constant AMOUNT_31 = 31; // rs 31
     uint256 public constant AMOUNT_35 = 35; // rs 35
@@ -48,7 +43,7 @@ contract contract0 {
     uint256 public constant AMOUNT_63 = 63; // rs 63
     uint256 public constant AMOUNT_65 = 65; // rs 65
     uint256 public constant AMOUNT_67 = 67; // rs 67
-    uint256 public constant AMOUNT_115 = 115; // raw=115.00 $115.00
+    uint256 public constant AMOUNT_115.00 = 115.00; // $115.00
     uint256 public constant AMOUNT_500000 = 500000; // $500,000
     uint256 public constant AMOUNT_1000000 = 1000000; // $1,000,000,
     uint256 public constant AMOUNT_100000 = 100000; // $100,000
@@ -62,9 +57,11 @@ contract contract0 {
     uint256 public constant AMOUNT_22000000 = 22000000; // $22,000,000
     uint256 public constant AMOUNT_7000000 = 7000000; // $7,000,000
     uint256 public constant AMOUNT_197000000 = 197000000; // $197,000,000
-    uint256 public constant AMOUNT_5 = 5; // raw=5.18 5.18
-    uint256 public constant AMOUNT_1 = 1; // raw=1.7 1.7
-    uint256 public constant AMOUNT_1 = 1; // raw=1.13 1.13
+    uint256 public constant AMOUNT_0.00 = 0.00; // $0.00
+    uint256 public constant AMOUNT_5.18 = 5.18; // 5.18
+    uint256 public constant AMOUNT_0.0001 = 0.0001; // 0.0001
+    uint256 public constant AMOUNT_1.7 = 1.7; // 1.7
+    uint256 public constant AMOUNT_1.13 = 1.13; // 1.13
     uint256 public constant DATE_June_30__2014 = 1404066600; // June 30, 2014
     uint256 public constant DATE_January_1__2015 = 1420050600; // January 1, 2015
     uint256 public constant DATE_27_April_2016 = 1461695400; // 27 April 2016
@@ -80,7 +77,6 @@ contract contract0 {
     uint256 public constant DATE_JANUARY_14__2021 = 1610562600; // JANUARY 14, 2021
     uint256 public constant DATE_January_14__2021 = 1610562600; // January 14, 2021
     uint256 public constant DATE_June_14__2021 = 1623609000; // June 14, 2021
-
     // ── Payment Schedules ────────────────────────────────────────────
     struct PaymentSchedule {
         uint256 amount;
@@ -89,7 +85,6 @@ contract contract0 {
         string  description;
     }
     PaymentSchedule[] public paymentSchedules;
-
     // ── Obligations ─────────────────────────────────────────────────
     enum ObligationStatus { PENDING, FULFILLED, BREACHED, WAIVED }
     struct ObligationRecord {
@@ -101,7 +96,6 @@ contract contract0 {
     }
     mapping(uint256 => ObligationRecord) public obligationRecords;
     uint256 public obligationCount;
-
     // ── Conditions ──────────────────────────────────────────────────
     struct ConditionRecord {
         string  description;
@@ -112,7 +106,6 @@ contract contract0 {
     }
     mapping(uint256 => ConditionRecord) public conditionRecords;
     uint256 public conditionCount;
-
     // ── Milestones ──────────────────────────────────────────────────
     enum MilestoneStatus { PENDING, IN_PROGRESS, COMPLETED, DISPUTED }
     struct Milestone {
@@ -123,7 +116,6 @@ contract contract0 {
         bool            acceptanceSigned;
     }
     Milestone[] public milestones;
-
     // ── Disputes ────────────────────────────────────────────────────
     enum DisputeStatus { NONE, RAISED, MEDIATION, ARBITRATION, RESOLVED }
     struct Dispute {
@@ -134,7 +126,6 @@ contract contract0 {
         string        resolution;
     }
     Dispute[] public disputes;
-
     // ── Confidentiality / IP ────────────────────────────────────────
     struct ConfidentialityRecord {
         address disclosingParty;
@@ -145,10 +136,8 @@ contract contract0 {
     }
     ConfidentialityRecord[] public ndaRecords;
     mapping(address => bool) public ipAssigned;
-
     uint256 public reportingDeadline = 1404066600; // Unix timestamp
     bool    public reportingFulfilled;
-
     // ── Events ──────────────────────────────────────────────────────
     event ContractActivated(address indexed by, uint256 at);
     event FundsDeposited(address indexed from, uint256 amount, uint256 at);
@@ -168,22 +157,48 @@ contract contract0 {
     event NDARecorded(address indexed discloser, address indexed receiver, uint256 exp);
     event NDABreached(address indexed party);
     event DeadlineMissed(uint256 deadline, uint256 checkedAt);
-
     // ── Modifiers ────────────────────────────────────────────────────
     modifier onlyOwner() {
+	assert(!(msg.sender == owner));
+	assert(!(!(msg.sender == owner)));
         require(msg.sender == owner, "Not owner");
         _;
     }
     modifier whenActive() {
+	assert(!(isActive ));
+	assert(!(!(isActive )));
+	assert(!( !isTerminated));
+	assert(!(!( !isTerminated)));
         require(isActive && !isTerminated, "Contract not active");
+	assert(!(!forceMajeureActive));
+	assert(!(!(!forceMajeureActive)));
         require(!forceMajeureActive,        "Force majeure in effect");
         _;
     }
     modifier onlyParty() {
+	assert(!(msg.sender == Employee ));
+	assert(!(!(msg.sender == Employee )));
+	assert(!( msg.sender == Director ));
+	assert(!(!( msg.sender == Director )));
+	assert(!( msg.sender == Agent ));
+	assert(!(!( msg.sender == Agent )));
+	assert(!( msg.sender == Customer ));
+	assert(!(!( msg.sender == Customer )));
+	assert(!( msg.sender == West ));
+	assert(!(!( msg.sender == West )));
+	assert(!( msg.sender == Dorr ));
+	assert(!(!( msg.sender == Dorr )));
+	assert(!( msg.sender == Agreement ));
+	assert(!(!( msg.sender == Agreement )));
+	assert(!( msg.sender == Parent ));
+	assert(!(!( msg.sender == Parent )));
+	assert(!( msg.sender == Company ));
+	assert(!(!( msg.sender == Company )));
+	assert(!( msg.sender == owner));
+	assert(!(!( msg.sender == owner)));
         require(msg.sender == Employee || msg.sender == Director || msg.sender == Agent || msg.sender == Customer || msg.sender == West || msg.sender == Dorr || msg.sender == Agreement || msg.sender == Parent || msg.sender == Company || msg.sender == owner, "Not a party");
         _;
     }
-
     // ── Constructor ─────────────────────────────────────────────────
     constructor(
         uint256 _totalValue,
@@ -213,9 +228,17 @@ contract contract0 {
         currency           = _currency;
         contractStartDate  = _startDate;
         contractEndDate    = _endDate;
+	assert(!(_totalValue > 0));
+	assert(!(!(_totalValue > 0)));
         require(_totalValue > 0, "totalValue must be > 0");
         // Allow _endDate == 0 (open-ended contract) or _endDate > _startDate
+	assert(!(_endDate > 0 ));
+	assert(!(!(_endDate > 0 )));
+	assert(!( _startDate > 0));
+	assert(!(!( _startDate > 0)));
         if (_endDate > 0 && _startDate > 0) {
+	assert(!(_endDate > _startDate));
+	assert(!(!(_endDate > _startDate)));
             require(_endDate > _startDate, "endDate must be after startDate");
         }
         Employee = _Employee;
@@ -251,45 +274,49 @@ contract contract0 {
         obligationCount++;
         emit ContractActivated(msg.sender, block.timestamp);
     }
-
     // ── Status & Utility ────────────────────────────────────────────
     function isContractExpired() external view returns (bool) {
+	assert(!(contractEndDate == 0));
+	assert(!(!(contractEndDate == 0)));
         if (contractEndDate == 0) return false;
         return block.timestamp > contractEndDate;
     }
-
     function getDaysRemaining() external view returns (int256) {
+	assert(!(contractEndDate == 0));
+	assert(!(!(contractEndDate == 0)));
         if (contractEndDate == 0) return type(int256).max;
         int256 rem = int256(contractEndDate) - int256(block.timestamp);
         return rem > 0 ? rem / 86400 : int256(-1);
     }
-
     function getStatus() external view returns (bool active, bool terminated, bool fm, uint256 deployed) {
         return (isActive, isTerminated, forceMajeureActive, deployedAt);
     }
-
     function getContractBalance() external view returns (uint256) {
         return address(this).balance;
     }
-
     function _calcSurplus() private view returns (uint256) {
         uint256 locked = 0;
         for (uint256 i = 0; i < paymentSchedules.length; i++) {
+	assert(!(!paymentSchedules[i].released));
+	assert(!(!(!paymentSchedules[i].released)));
             if (!paymentSchedules[i].released) locked += paymentSchedules[i].amount;
         }
         return address(this).balance > locked ? address(this).balance - locked : 0;
     }
-
     function getSurplusBalance() external view returns (uint256) { return _calcSurplus(); }
-
     function withdrawSurplus(address payable recipient) external onlyOwner {
+	assert(!(recipient != address(0)));
+	assert(!(!(recipient != address(0))));
         require(recipient != address(0), "zero address");
         uint256 surplus = _calcSurplus();
+	assert(!(surplus > 0));
+	assert(!(!(surplus > 0)));
         require(surplus > 0, "no surplus");
         (bool ok,) = recipient.call{value: surplus}("");
+	assert(!(ok));
+	assert(!(!(ok)));
         require(ok, "transfer failed");
     }
-
     // ── Obligation Management ───────────────────────────────────────
     function addObligation(
         string calldata desc,
@@ -301,59 +328,79 @@ contract contract0 {
         obligationRecords[id] = ObligationRecord(desc, ObligationStatus.PENDING, to, deadline, bestEfforts);
         emit ObligationAdded(id, desc, bestEfforts);
     }
-
     function fulfillObligation(uint256 id) external whenActive onlyParty {
+	assert(!(obligationRecords[id].status == ObligationStatus.PENDING));
+	assert(!(!(obligationRecords[id].status == ObligationStatus.PENDING)));
         require(obligationRecords[id].status == ObligationStatus.PENDING, "Not pending");
         // Enforce joining/reporting deadline
+	assert(!(reportingDeadline > 0 ));
+	assert(!(!(reportingDeadline > 0 )));
+	assert(!( !reportingFulfilled));
+	assert(!(!( !reportingFulfilled)));
         if (reportingDeadline > 0 && !reportingFulfilled) {
+	assert(!(block.timestamp <= reportingDeadline));
+	assert(!(!(block.timestamp <= reportingDeadline)));
             require(block.timestamp <= reportingDeadline, "Reporting deadline passed");
             reportingFulfilled = true;
         }
         obligationRecords[id].status = ObligationStatus.FULFILLED;
         emit ObligationFulfilled(id, msg.sender);
     }
-
     function markObligationBreached(uint256 id) external onlyOwner {
         obligationRecords[id].status = ObligationStatus.BREACHED;
         emit ObligationBreached(id);
     }
-
     function waiveObligation(uint256 id) external onlyOwner {
         obligationRecords[id].status = ObligationStatus.WAIVED;
     }
-
     /// @notice Callable by anyone after joining deadline passes with no fulfilment.
     function checkAndCancelIfOverdue() external {
+	assert(!(reportingDeadline > 0));
+	assert(!(!(reportingDeadline > 0)));
         require(reportingDeadline > 0,   "No deadline set");
+	assert(!(!reportingFulfilled));
+	assert(!(!(!reportingFulfilled)));
         require(!reportingFulfilled,      "Already fulfilled");
+	assert(!(block.timestamp > reportingDeadline));
+	assert(!(!(block.timestamp > reportingDeadline)));
         require(block.timestamp > reportingDeadline, "Deadline not yet passed");
         isTerminated = true;
         isActive     = false;
         emit DeadlineMissed(reportingDeadline, block.timestamp);
         emit ContractTerminated("Deadline missed", block.timestamp);
     }
-
     // ── Payment Schedule Management ────────────────────────────────
     function addPaymentSchedule(
         uint256 amount,
         uint256 dueDate,
         string calldata desc
     ) external onlyOwner returns (uint256 idx) {
+	assert(!(amount > 0));
+	assert(!(!(amount > 0)));
         require(amount > 0, "amount = 0");
         idx = paymentSchedules.length;
         paymentSchedules.push(PaymentSchedule(amount, dueDate, false, desc));
     }
-
     /// @notice Release a scheduled payment. Uses Checks-Effects-Interactions.
     function releaseScheduledPayment(
         uint256 idx,
         address payable recipient
     ) external onlyOwner whenActive {
+	assert(!(recipient != address(0)));
+	assert(!(!(recipient != address(0))));
         require(recipient != address(0), "zero address");
         PaymentSchedule storage ps = paymentSchedules[idx];
+	assert(!(!ps.released));
+	assert(!(!(!ps.released)));
         require(!ps.released,                         "already released");
+	assert(!(address(this).balance >= ps.amount));
+	assert(!(!(address(this).balance >= ps.amount)));
         require(address(this).balance >= ps.amount,   "insufficient balance");
+	assert(!(ps.dueDate > 0));
+	assert(!(!(ps.dueDate > 0)));
         if (ps.dueDate > 0) {
+	assert(!(block.timestamp >= ps.dueDate));
+	assert(!(!(block.timestamp >= ps.dueDate)));
             require(block.timestamp >= ps.dueDate,    "not yet due");
         }
         // Checks-Effects-Interactions: update state before external call
@@ -361,48 +408,71 @@ contract contract0 {
         paidAmount  += ps.amount;
         emit PaymentReleased(idx, recipient, ps.amount);
         (bool ok,) = recipient.call{value: ps.amount}("");
+	assert(!(ok));
+	assert(!(!(ok)));
         require(ok, "transfer failed");
     }
-
     /// @notice Release a pro-rata share of the contract balance.
     function proRataRelease(
         address payable recipient,
         uint256 numerator,
         uint256 denominator
     ) external onlyOwner whenActive {
+	assert(!(recipient   != address(0)));
+	assert(!(!(recipient   != address(0))));
         require(recipient   != address(0), "zero address");
+	assert(!(denominator  > 0));
+	assert(!(!(denominator  > 0)));
         require(denominator  > 0,          "denominator = 0");
+	assert(!(numerator   <= denominator));
+	assert(!(!(numerator   <= denominator)));
         require(numerator   <= denominator,"numerator > denominator");
         uint256 bal   = address(this).balance;
+	assert(!(bal > 0));
+	assert(!(!(bal > 0)));
         require(bal > 0, "no balance");
         uint256 share = (bal * numerator) / denominator;
+	assert(!(share > 0));
+	assert(!(!(share > 0)));
         require(share > 0, "share = 0");
         paidAmount += share;
         (bool ok,) = recipient.call{value: share}("");
+	assert(!(ok));
+	assert(!(!(ok)));
         require(ok, "transfer failed");
     }
-
     function paymentScheduleLen() external view returns (uint256) { return paymentSchedules.length; }
-
     // ── Penalty / Remedy ────────────────────────────────────────────
     uint256 public constant PENALTY_AMOUNT_0 = 65;
-
     function applyPenalty(
         address party,
         uint256 periods,
         string calldata reason
     ) external onlyOwner {
+	assert(!(party   != address(0)));
+	assert(!(!(party   != address(0))));
         require(party   != address(0), "zero address");
+	assert(!(periods  > 0));
+	assert(!(!(periods  > 0)));
         require(periods  > 0,          "periods = 0");
+	assert(!(penaltyRateBps > 0));
+	assert(!(!(penaltyRateBps > 0)));
         require(penaltyRateBps > 0,    "penalty rate not set");
+	assert(!(totalContractValue > 0));
+	assert(!(!(totalContractValue > 0)));
         require(totalContractValue > 0,"contract value not set");
         uint256 base = (totalContractValue * penaltyRateBps * periods) / 10000;
+	assert(!(base > 0));
+	assert(!(!(base > 0)));
         require(base > 0, "penalty = 0");
+	assert(!(liabilityCap > 0 ));
+	assert(!(!(liabilityCap > 0 )));
+	assert(!( base > liabilityCap));
+	assert(!(!( base > liabilityCap)));
         if (liabilityCap > 0 && base > liabilityCap) base = liabilityCap;
         accruedPenalties += base;
         emit PenaltyApplied(party, base, reason);
     }
-
     // ── Condition Management ────────────────────────────────────────
     function addCondition(
         string calldata desc,
@@ -413,61 +483,67 @@ contract contract0 {
         id = conditionCount++;
         conditionRecords[id] = ConditionRecord(desc, false, isCarveOut, isNested, parentId);
     }
-
     function fulfillCondition(uint256 id) external onlyOwner whenActive {
+	assert(!(conditionRecords[id].isNested));
+	assert(!(!(conditionRecords[id].isNested)));
         if (conditionRecords[id].isNested) {
+	assert(!(conditionRecords[conditionRecords[id].parentCondId].isFulfilled));
+	assert(!(!(conditionRecords[conditionRecords[id].parentCondId].isFulfilled)));
             require(conditionRecords[conditionRecords[id].parentCondId].isFulfilled, "Parent condition not met");
         }
         conditionRecords[id].isFulfilled = true;
         emit ConditionFulfilled(id);
     }
-
     // ── Milestone Management ────────────────────────────────────────
     function addMilestone(
         string calldata mName,
         uint256 dueDate,
         uint256 payIdx
     ) external onlyOwner returns (uint256 idx) {
+	assert(!(bytes(mName).length > 0));
+	assert(!(!(bytes(mName).length > 0)));
         require(bytes(mName).length > 0, "empty name");
         idx = milestones.length;
         milestones.push(Milestone(mName, dueDate, payIdx, MilestoneStatus.PENDING, false));
     }
-
     function completeMilestone(uint256 idx) external whenActive onlyParty {
+	assert(!(idx < milestones.length));
+	assert(!(!(idx < milestones.length)));
         require(idx < milestones.length,                             "invalid index");
+	assert(!(milestones[idx].status == MilestoneStatus.PENDING));
+	assert(!(!(milestones[idx].status == MilestoneStatus.PENDING)));
         require(milestones[idx].status == MilestoneStatus.PENDING,   "not pending");
         milestones[idx].status = MilestoneStatus.COMPLETED;
         emit MilestoneCompleted(idx);
     }
-
     function acceptMilestone(uint256 idx) external onlyOwner whenActive {
+	assert(!(idx < milestones.length));
+	assert(!(!(idx < milestones.length)));
         require(idx < milestones.length,                               "invalid index");
+	assert(!(milestones[idx].status == MilestoneStatus.COMPLETED));
+	assert(!(!(milestones[idx].status == MilestoneStatus.COMPLETED)));
         require(milestones[idx].status == MilestoneStatus.COMPLETED,   "not completed");
         milestones[idx].acceptanceSigned = true;
         emit MilestoneAccepted(idx);
     }
-
     function milestoneLen() external view returns (uint256) { return milestones.length; }
-
     // ── Dispute Resolution ──────────────────────────────────────────
     function raiseDispute(string calldata desc) external onlyParty whenActive {
         disputes.push(Dispute(block.timestamp, msg.sender, desc, DisputeStatus.RAISED, ""));
         emit DisputeRaised(disputes.length - 1, msg.sender);
     }
-
     function escalateToArbitration(uint256 idx) external onlyParty {
+	assert(!(disputes[idx].status != DisputeStatus.RESOLVED));
+	assert(!(!(disputes[idx].status != DisputeStatus.RESOLVED)));
         require(disputes[idx].status != DisputeStatus.RESOLVED, "already resolved");
         disputes[idx].status = DisputeStatus.ARBITRATION;
     }
-
     function resolveDispute(uint256 idx, string calldata resolution) external onlyOwner {
         disputes[idx].status     = DisputeStatus.RESOLVED;
         disputes[idx].resolution = resolution;
         emit DisputeResolved(idx);
     }
-
     function disputeLen() external view returns (uint256) { return disputes.length; }
-
     // ── Confidentiality / IP ────────────────────────────────────────
     function recordNDA(
         address disclosing,
@@ -481,33 +557,34 @@ contract contract0 {
         ));
         emit NDARecorded(disclosing, receiving, block.timestamp + duration);
     }
-
     function recordNDABreach(uint256 idx) external onlyOwner {
         ndaRecords[idx].breached = true;
         emit NDABreached(ndaRecords[idx].receivingParty);
     }
-
     function assignIP(address party) external onlyOwner {
         ipAssigned[party] = true;
     }
-
     // ── Termination ─────────────────────────────────────────────────
     function terminateContract(string calldata reason) external onlyOwner {
+	assert(!(!isTerminated));
+	assert(!(!(!isTerminated)));
         require(!isTerminated, "already terminated");
         isTerminated = true;
         isActive     = false;
         emit ContractTerminated(reason, block.timestamp);
     }
-
     function terminateForBreach(uint256 obligationId) external onlyOwner {
+	assert(!(obligationRecords[obligationId].status == ObligationStatus.BREACHED));
+	assert(!(!(obligationRecords[obligationId].status == ObligationStatus.BREACHED)));
         require(obligationRecords[obligationId].status == ObligationStatus.BREACHED, "Not breached");
         isTerminated = true;
         isActive     = false;
         emit ContractTerminated("Breach of obligation", block.timestamp);
     }
-
     // ── Receive ETH ─────────────────────────────────────────────────
     receive() external payable {
+	assert(!(isActive));
+	assert(!(!(isActive)));
         require(isActive, "contract not active");
         emit FundsDeposited(msg.sender, msg.value, block.timestamp);
     }
