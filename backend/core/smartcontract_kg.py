@@ -55,15 +55,12 @@ def _ddmmyyyy_to_timestamp(date_str: str) -> str:
 
 def _unix_from_node(node: dict) -> str:
     """Extract unix timestamp from a DATE_DEADLINE node."""
-    # Prefer pre-computed unix_ts attribute
     ts = node.get("unix_ts", 0)
     if ts and ts != 0:
         return str(ts)
-    # Fall back: parse normalized DDMMYYYY
     normalized = node.get("normalized", "")
     if normalized:
         return _ddmmyyyy_to_timestamp(normalized)
-    # Last resort: parse label
     label = node.get("label", "")
     norm  = re.sub(r"[^0-9]", "", label)
     if len(norm) == 8:
@@ -165,7 +162,6 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract",
     def _payment_payer(pay_nid: str):
         for (src, tgt), e in edge_map.items():
             if tgt == pay_nid and e.get("relation") in ("PAYS", "HAS_OBLIGATION"):
-                # Find matching party node
                 for p in parties:
                     if p["id"] == src:
                         return p
@@ -233,9 +229,14 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract",
             continue
         seen_init_amounts.add(amt)
         label_safe = re.sub(r"[\"']", "", p.get("label", ""))[:40]
+        # Convert to a uint256-safe integer — decimals like "8.10" are not valid
+        # Solidity uint256 literals; _to_uint strips/scales to a plain integer string.
+        uint_amt = _to_uint(amt) if not re.fullmatch(r"\d+", amt) else amt
+        if not uint_amt or uint_amt == "0":
+            continue
         # Use 0 for dueDate in constructor — caller sets actual schedules post-deploy
         init_payments.append(
-            f'paymentSchedules.push(PaymentSchedule({amt}, 0, false, "{label_safe}"));'
+            f'paymentSchedules.push(PaymentSchedule({uint_amt}, 0, false, "{label_safe}"));'
         )
         if len(init_payments) >= 8:
             break
@@ -321,25 +322,29 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract",
     # Decimal/fractional amounts are stored as scaled uint256 (×10^18 wei) or
     # as a comment-only entry so the value still appears in the code for ValueCov.
     value_lines = ["    // ── E-Contract Values ──────────────────────────────────────────"]
-    emitted_amounts: set = set()
+    emitted_amounts: set = set()   # tracks raw amt strings (dedup source values)
+    emitted_const_names: set = set()  # tracks generated safe_name (dedup identifier collisions)
     for p in payments:
         amt = p.get("amount", "")
         if not amt or amt == "0" or amt in emitted_amounts:
             continue
         emitted_amounts.add(amt)
         label_comment = p.get("label","")[:40]
-        # Only emit as uint256 constant if amt is a pure integer
         if re.fullmatch(r"\d+", amt):
             safe_name = re.sub(r"[^A-Za-z0-9_]", "_", amt).strip("_")
+            if safe_name in emitted_const_names:
+                continue
+            emitted_const_names.add(safe_name)
             value_lines.append(
                 f"    uint256 public constant AMOUNT_{safe_name} = {amt};"
                 f" // {label_comment}")
         else:
-            # Fractional: store the integer part as a constant + full value in comment
             int_part = amt.split(".")[0] if "." in amt else re.sub(r"[^0-9]","",amt)
             if int_part and int_part != "0":
                 safe_name = re.sub(r"[^A-Za-z0-9_]", "_", int_part).strip("_")
-                # Scale to 18 decimal places to preserve fractional value
+                if safe_name in emitted_const_names:
+                    continue
+                emitted_const_names.add(safe_name)
                 frac_part = (amt.split(".")[1] if "." in amt else "")[:18].ljust(18,"0")
                 scaled    = int_part + frac_part.rstrip("0") or int_part
                 value_lines.append(
@@ -533,17 +538,28 @@ def kg_to_solidity(kg: dict, contract_name: str = "EContract",
     ])
 
     # ── Constructor ───────────────────────────────────────────────────────────
-    party_params = "".join(f",\n        address _{pid}" for pid, _ in party_pairs)
+    # Store every param WITHOUT a trailing comma; the join adds exactly one
+    # comma after each line except the last — guaranteed no double-commas.
+    all_params = [
+        "        uint256 _totalValue",
+        "        uint256 _penaltyBps",
+        "        uint256 _penaltyPeriod",
+        "        uint256 _liabilityCap",
+    ] + [
+        f"        address _{pid}" for pid, _ in party_pairs
+    ] + [
+        "        string memory _currency",
+        "        uint256 _startDate",
+        "        uint256 _endDate",
+    ]
+    param_block = "\n".join(
+        (line + "," if i < len(all_params) - 1 else line)
+        for i, line in enumerate(all_params)
+    )
     w([
         "    // ── Constructor ─────────────────────────────────────────────────",
         "    constructor(",
-        "        uint256 _totalValue,",
-        "        uint256 _penaltyBps,",
-        "        uint256 _penaltyPeriod,",
-        "        uint256 _liabilityCap," + party_params + ",",
-        "        string memory _currency,",
-        "        uint256 _startDate,",
-        "        uint256 _endDate",
+        param_block,
         "    ) {",
         "        owner              = msg.sender;",
         "        isActive           = true;",

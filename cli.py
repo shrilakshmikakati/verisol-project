@@ -272,7 +272,6 @@ def cmd_run_multi(args):
         sol_path, accuracy, status = None, None, "ERROR"
         try:
             sol_path = run_pipeline(str(temp_txt), contract_name, str(page_out_dir), page_number=page_num, page_title=title)
-            # Copy .sol up to base output with page-numbered name
             gen_sol   = page_out_dir / f"{contract_name}.sol"
             final_sol = base_out / f"{contract_name}.sol"
             if gen_sol.exists(): shutil.copy2(gen_sol, final_sol)
