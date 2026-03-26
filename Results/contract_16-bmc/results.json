@@ -1,0 +1,25 @@
+{
+  "contract_name": "contract_16",
+  "source_file": "contract_16.txt",
+  "generated_at": "2026-03-26T11:53:31.203687Z",
+  "solidity_version": "0.8.16",
+  "pipeline": {
+    "iterations_used": 0,
+    "llm_model": "qwen2.5:7b"
+  },
+  "initial_comparison": {
+    "accuracy": 92.81,
+    "node_similarity": 89.61,
+    "edge_similarity": 90.0,
+    "is_valid": true
+  },
+  "final_comparison": {
+    "accuracy": 92.81,
+    "node_similarity": 89.61,
+    "edge_similarity": 90.0,
+    "is_valid": true,
+    "ec_node_count": 513,
+    "sc_node_count": 210
+  },
+  "final_comparison_is_validated": true
+}
