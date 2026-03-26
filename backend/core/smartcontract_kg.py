@@ -34,14 +34,19 @@ def _safe_id(s: str, n: int = 32) -> str:
     return clean[:n] or "item"
 
 def _to_uint(v: str) -> str:
-    """Extract a uint256-compatible integer string from a value like '$1,000' or '10000'."""
+    """Extract a uint256-compatible integer string from a value like '$1,000' or '10000'.
+
+    Decimal values are scaled by 10^18 (wei-style). Leading zeros are stripped
+    so the result is never mis-parsed as a Solidity octal literal (e.g. 0010...).
+    """
     m = re.search(r"[\d,]+(?:\.\d+)?", v)
     if not m: return "0"
     r = m.group().replace(",", "")
     if "." in r:
-        p = r.split(".")
-        return p[0] + p[1].ljust(18, "0")[:18]
-    return r
+        int_part, frac_part = r.split(".", 1)
+        scaled = (int_part + frac_part.ljust(18, "0")[:18]).lstrip("0") or "0"
+        return scaled
+    return r.lstrip("0") or "0"
 
 def _ddmmyyyy_to_timestamp(date_str: str) -> str:
     """Convert DDMMYYYY to Unix timestamp string. Returns '0' on failure."""
